@@ -312,9 +312,13 @@ where
 
 #[cfg(test)]
 mod tests_ {
-    use std::{sync::{Arc, Weak}, vec::Vec};
+    use std::{
+        ops::Deref,
+        sync::{Arc, Weak},
+        vec::Vec,
+    };
     use core_malloc::CoreAlloc;
-    use super::*;
+    use super::{Owned, XtMallocOwned};
 
     #[test]
     fn drop_owned_should_drop_item() {

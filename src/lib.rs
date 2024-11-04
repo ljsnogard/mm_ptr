@@ -14,9 +14,11 @@ extern crate std;
 mod alloc_for_layout_;
 mod owned_;
 mod shared_;
+mod reclaim_;
 
 pub use owned_::{Owned, XtMallocOwned};
 pub use shared_::{Shared, Weak, XtMallocShared};
+pub use reclaim_::{NoReclaim, Reclaim};
 
 pub mod x_deps {
     pub use abs_mm;

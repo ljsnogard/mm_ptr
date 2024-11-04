@@ -51,7 +51,7 @@ where
     }
 
     fn reclaim_(r: &mut Option<F>, p: &mut P) {
-        if let Option::Some(recl) = self.reclaim_.take() {
+        if let Option::Some(recl) = r.take() {
             recl(p)
         }
     }

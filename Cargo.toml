@@ -1,6 +1,6 @@
 ﻿[package]
 name = "mm_ptr"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 abs_mm = { git = "https://github.com/ljsnogard/abs_mm", tag = "0.1.1" }
-atomic_sync = { git = "https://github.com/ljsnogard/atomic_sync", tag = "0.1.1" }
+atomic_sync = { git = "https://github.com/ljsnogard/atomic_sync", branch = "dev/0.1.2" }
 
 [dev-dependencies]
 core_malloc = { git = "https://github.com/ljsnogard/core_malloc", tag = "0.1.1" }

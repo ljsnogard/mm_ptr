@@ -81,7 +81,7 @@ where
 {
     pub fn new_slice(
         len: usize,
-        mut init_each: impl FnMut(usize) -> T,
+        mut init_each: impl FnMut(usize, &mut MaybeUninit<T>) -> &mut T,
         alloc: A,
     ) -> Self {
         unsafe {
@@ -90,7 +90,8 @@ where
             let mut p = SharedInner::from_inner_with_slice(a, len);
             let inner = p.as_mut();
             for (i, x) in inner.data_().as_mut().iter_mut().enumerate() {
-                ptr::write(x, init_each(i))
+                let m = x as *mut T as *mut MaybeUninit<T>;
+                let _ = init_each(i, &mut *m);
             }
             Self::from_shared_inner_(inner)
         }
@@ -192,33 +193,44 @@ where
     T: ?Sized,
     A: TrMalloc + Clone,
 {
+    /// Allocate a header for weak pointers if it is not allocated, and then
+    /// create a `Weak<T, A>` associated with the header.
     pub fn downgrade(shared: &Shared<T, A>) -> Weak<T, A> {
         let shared_inner = unsafe { shared.0.as_ref() };
-        let mut p_weak_inner = shared_inner.weak_().pointer();
-        if p_weak_inner.is_null() {
-            let back_track = unsafe {
-                let p = shared_inner as *const _ as *mut _;
-                let p = NonNull::new_unchecked(p);
-                Option::Some(p)
-            };
-            let mut addr = unsafe {
-                NonNull::new_unchecked(WeakInner::allocate_weak_inner(
-                    back_track,
-                    shared_inner.allocator(),
-                ))
-            };
-            match shared_inner.weak_().try_spin_init(addr) {
-                Result::Ok(_) => {
-                    p_weak_inner = unsafe { addr.as_mut() };
+        let atom_weak = shared_inner.weak_();
+        let p_weak_inner: * mut WeakInner<T, A>;
+        let atom_guard = unsafe {
+            let ptr = shared_inner
+                as *const _ 
+                as *mut SharedInner<T, A>
+                as *mut WeakInner<T, A>;
+            NonNull::new_unchecked(ptr)
+        };
+        loop {
+            let r = atom_weak.try_spin_init(atom_guard);
+            if let Result::Err(p) = r {
+                if !ptr::eq(p.as_ptr(), atom_guard.as_ptr()) {
+                    p_weak_inner = p.as_ptr();
+                    break;
                 }
-                Result::Err(mut x) => {
-                    WeakInner::release_weak_inner(unsafe { x.as_mut() });
-                    p_weak_inner = x.as_ptr();
-                }
+            } else {
+                let back_track = unsafe {
+                    let p = shared_inner as *const _ as *mut _;
+                    let p = NonNull::new_unchecked(p);
+                    Option::Some(p)
+                };
+                p_weak_inner = unsafe {
+                    WeakInner::allocate_weak_inner(
+                        back_track,
+                        shared_inner.allocator(),
+                    )
+                };
+                atom_weak.store(p_weak_inner);
+                break;
             }
         }
-        let weak_inner = unsafe { &*p_weak_inner };
-        Weak::from_weak_inner_(weak_inner)
+        assert!(!p_weak_inner.is_null());
+        Weak::from_weak_inner_(unsafe { &*p_weak_inner })
     }
 
     pub fn strong_count(shared: &Shared<T, A>) -> usize {
@@ -322,12 +334,13 @@ where
     A: TrMalloc + Clone,
 {
     fn eq(&self, other: &Weak<T, A>) -> bool {
-        other
-            .opt_weak_inner_()
-            .and_then(|w| w.current_back_track())
-            .map_or(false, |back_track| {
-                ptr::eq(back_track.as_ptr(), self.shared_inner_())
-            })
+        let Option::Some(w) = other.opt_weak_inner_() else {
+            return false;
+        };
+        let Option::Some(back_track) = w.current_back_track() else {
+            return false;
+        };
+        ptr::eq(back_track.as_ptr(), self.shared_inner_())
     }
 }
 
@@ -506,9 +519,13 @@ impl<T: ?Sized, A: TrMalloc + Clone> cmp::Eq for Weak<T, A> {}
 
 impl<T: ?Sized, A: TrMalloc + Clone> cmp::PartialEq<Shared<T, A>> for Weak<T, A> {
     fn eq(&self, other: &Shared<T, A>) -> bool {
-        self.opt_weak_inner_()
-            .and_then(|w| w.current_back_track())
-            .map_or(false, |p| ptr::eq(p.as_ptr(), other.shared_inner_()))
+        let Option::Some(w) = self.opt_weak_inner_() else {
+            return false;
+        };
+        let Option::Some(p) = w.current_back_track() else {
+            return false;
+        };
+        ptr::eq(p.as_ptr(), other.shared_inner_())
     }
 }
 
@@ -784,7 +801,7 @@ mod tests_ {
         const LEN: usize = 1024;
         let shared = Shared::<[Arc<usize>], CoreAlloc>::new_slice(
             LEN, 
-            Arc::new,
+            |u, m| m.write(Arc::new(u)),
             CoreAlloc::new(),
         );
         let arc_clone: Vec<_> = shared.iter().cloned().collect();
@@ -807,14 +824,12 @@ mod tests_ {
         let x = arc_clone
             .into_iter()
             .enumerate()
-            .map(|(u, a)| u == *a)
-            .all(|b| b);
+            .all(|(u, a)| u == *a);
         assert!(x, "all equal");
 
         let x = arc_weak
             .into_iter()
-            .map(|w| w.upgrade().is_none())
-            .all(|b| b);
+            .all(|w| w.upgrade().is_none());
         assert!(x, "all upgrade is none");
     }
 

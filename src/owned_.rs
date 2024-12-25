@@ -50,19 +50,21 @@ where
 
 impl<T, A> Owned<[T], A>
 where
+    T: Sized,
     A: TrMalloc + Clone,
 {
     pub fn new_slice(
         len: usize,
-        mut init_each: impl FnMut(usize) -> T,
+        mut init_each: impl FnMut(usize, &mut MaybeUninit<T>) -> &mut T,
         alloc: A,
     ) -> Self {
         unsafe {
             let mut a = AllocForLayout::<A, (), [T]>
                 ::allocate_for_inner_with_slice(len, alloc);
             let inner = a.as_mut();
-            for (i, x) in inner.data().as_mut().iter_mut().enumerate() {
-                ptr::write(x, init_each(i))
+            for (u, x) in inner.data().as_mut().iter_mut().enumerate() {
+                let m = x as *mut T as *mut MaybeUninit<T>;
+                let _ = init_each(u, &mut *m);
             }
             Self::from_owned_inner_(inner)
         }
@@ -344,7 +346,7 @@ mod tests_ {
     fn drop_owned_slice_should_drop_all_items() {
         let u_slice = Owned::new_slice(
             16usize,
-            |_| Arc::new(0usize),
+            |_, m| m.write(Arc::new(0usize)),
             CoreAlloc::new()
         );
         let w_slice: Vec<Weak<usize>> = u_slice

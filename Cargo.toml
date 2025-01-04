@@ -5,17 +5,17 @@ edition = "2021"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
 description = "Smart pointers implementing abs_mm"
-homepage = "https://github.com/ljsnogard/mm_ptr"
+repository = "https://github.com/ljsnogard/mm_ptr"
 keywords = ["pointer", "alloc"]
 categories = ["no-std"]
 license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_mm = { git = "https://github.com/ljsnogard/abs_mm", tag = "0.1.1" }
-atomic_sync = { git = "https://github.com/ljsnogard/atomic_sync", branch = "dev/0.1.2" }
+abs_mm = { git = "https://github.com/ljsnogard/abs_mm", branch = "dev/0.1.2" }
+atomex = { git = "https://github.com/ljsnogard/atomex-rs", branch = "dev/0.1.1" }
 
 [dev-dependencies]
-core_malloc = { git = "https://github.com/ljsnogard/core_malloc", tag = "0.1.1" }
+core_malloc = { git = "https://github.com/ljsnogard/core_malloc", branch = "dev/0.1.2" }
 log = { version = "0.4.*" }
 env_logger = { version = "0.11.*" }

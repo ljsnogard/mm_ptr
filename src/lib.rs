@@ -24,6 +24,5 @@ pub use shared_::{Shared, Weak, XtMallocShared};
 
 pub mod x_deps {
     pub use abs_mm;
-    pub use atomic_sync::x_deps::{abs_sync, atomex};
-    pub use atomic_sync;
+    pub use atomex;
 }

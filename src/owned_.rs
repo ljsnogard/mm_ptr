@@ -83,6 +83,12 @@ where
             Self::from_owned_inner_(inner)
         }
     }
+
+    pub fn new_zeroed_slice(len: usize, alloc: A) -> Self {
+        let mut x = Self::new_uninit_slice(len, alloc);
+        x.iter_mut().for_each(|m| *m = MaybeUninit::zeroed());
+        x
+    }
 }
 
 impl<'a, T, A> Owned<T, A>
@@ -282,7 +288,9 @@ impl<T, A> TrUnique for Owned<T, A>
 where
     T: ?Sized,
     A: TrMalloc + Clone,
-{}
+{
+    type Item = T;
+}
 
 unsafe impl<T, A> Send for Owned<T, A>
 where

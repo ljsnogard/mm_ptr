@@ -13,10 +13,9 @@
 
 use abs_mm::{
     mem_alloc::TrMalloc,
-    res_man::{TrBoxed, TrShared},
+    res_man::{TrBoxed, TrShared, TrWeak},
 };
 use atomex::{AtomicCount, AtomexPtr};
-use atomic_sync::x_deps::atomex;
 
 use crate::{
     owned_::{Owned, XtMallocOwned},
@@ -113,6 +112,16 @@ where
             let inner = p.as_mut();
             Self::from_shared_inner_(inner)
         }
+    }
+
+    pub fn new_zeroed_slice(len: usize, alloc: A) -> Self {
+        let x = Self::new_uninit_slice(len, alloc);
+        let p = unsafe {
+            // Safe because x is the only owner of the memory allocated
+            &mut *(x.as_ptr() as *mut [MaybeUninit<T>])
+        };
+        p.iter_mut().for_each(|m| *m = MaybeUninit::zeroed());
+        x
     }
 }
 
@@ -372,14 +381,22 @@ where
     T: ?Sized,
     A: TrMalloc + Clone,
 {
-    #[inline(always)]
+    type Item = T;
+    type Downgraded = self::Weak<T, A>;
+
+    #[inline]
     fn strong_count(&self) -> usize {
         Shared::strong_count(self)
     }
 
-    #[inline(always)]
+    #[inline]
     fn weak_count(&self) -> usize {
         Shared::weak_count(self)
+    }
+
+    #[inline]
+    fn downgrade(&self) -> Self::Downgraded {
+        Shared::downgrade(self)
     }
 }
 
@@ -492,6 +509,30 @@ where
         } else {
             Weak::default()
         }
+    }
+}
+
+impl<T, A> TrWeak for Weak<T, A>
+where
+    T: ?Sized,
+    A: TrMalloc + Clone,
+{
+    type Item = T;
+    type Upgraded = self::Shared<T, A>;
+
+    #[inline]
+    fn strong_count(&self) -> usize {
+        Weak::strong_count(self)
+    }
+
+    #[inline]
+    fn weak_count(&self) -> usize {
+        Weak::weak_count(self)
+    }
+
+    #[inline]
+    fn upgrade(&self) -> Option<Self::Upgraded> {
+        Weak::upgrade(self)
     }
 }
 

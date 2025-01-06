@@ -80,7 +80,7 @@ where
 {
     pub fn new_slice(
         len: usize,
-        mut init_each: impl FnMut(usize, &mut MaybeUninit<T>) -> &mut T,
+        mut init_each: impl FnMut(usize, &mut MaybeUninit<T>),
         alloc: A,
     ) -> Self {
         unsafe {
@@ -90,7 +90,7 @@ where
             let inner = p.as_mut();
             for (i, x) in inner.data_().as_mut().iter_mut().enumerate() {
                 let m = x as *mut T as *mut MaybeUninit<T>;
-                let _ = init_each(i, &mut *m);
+                init_each(i, &mut *m);
             }
             Self::from_shared_inner_(inner)
         }
@@ -842,7 +842,7 @@ mod tests_ {
         const LEN: usize = 1024;
         let shared = Shared::<[Arc<usize>], CoreAlloc>::new_slice(
             LEN, 
-            |u, m| m.write(Arc::new(u)),
+            |u, m| { m.write(Arc::new(u)); },
             CoreAlloc::new(),
         );
         let arc_clone: Vec<_> = shared.iter().cloned().collect();

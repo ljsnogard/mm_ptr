@@ -3,8 +3,9 @@
     borrow::{Borrow, BorrowMut},
     cmp,
     fmt,
+    marker::Unsize,
     mem::{self, MaybeUninit},
-    ops::{Deref, DerefMut},
+    ops::{CoerceUnsized, Deref, DerefMut},
     pin::Pin,
     ptr::{self, NonNull}
 };
@@ -14,9 +15,9 @@ use abs_mm::{
     res_man::{TrBoxed, TrUnique},
 };
 
-use crate::alloc_for_layout_::{AllocForLayout, Inner};
+use crate::alloc_utils_::handle_alloc_error_;
 
-type OwnedInner<T, A> = Inner<A, (), T>;
+// type OwnedInner<T, A> = Inner<A, (), T>;
 
 /// A smart pointer with specified allocator.
 #[derive(Debug)]
@@ -27,18 +28,19 @@ where
 
 impl<T, A> Owned<T, A>
 where
+    T: Sized,
     A: TrMalloc + Clone,
 {
     pub fn new(data: T, alloc: A) -> Self {
-        let mem_to_inner = |mem| { mem as *mut Inner<A, (), T> };
+        let mem_to_inner = |mem| { mem as *mut OwnedInner<T, A> };
         unsafe {
-            let mut inner = AllocForLayout::allocate_for_layout(
+            let inner = Self::allocate_for_layout(
                 alloc,
                 Layout::for_value(&data),
                 mem_to_inner
             );
-            let inner = inner.as_mut();
-            inner.data().as_ptr().write(data);
+            let inner = &mut *inner;
+            inner.data_ptr().as_ptr().write(data);
             Self::from_owned_inner_(inner)
         }
     }
@@ -59,26 +61,41 @@ where
         alloc: A,
     ) -> Self {
         unsafe {
-            let mut a = AllocForLayout::<A, (), [T]>
-                ::allocate_for_inner_with_slice(len, alloc);
+            let mut a = Self::allocate_for_inner_with_slice(alloc, len);
             let inner = a.as_mut();
-            for (u, x) in inner.data().as_mut().iter_mut().enumerate() {
+            for (u, x) in inner.data_ptr().as_mut().iter_mut().enumerate() {
                 let m = x as *mut T as *mut MaybeUninit<T>;
                 init_each(u, &mut *m);
             }
             Self::from_owned_inner_(inner)
         }
     }
+
+    unsafe fn allocate_for_inner_with_slice(
+        alloc: A,
+        len: usize,
+    ) -> NonNull<OwnedInner<[T], A>> {
+        let mem_to_inner = |mem: *mut u8| {
+            let p = mem.cast::<T>();
+            ptr::slice_from_raw_parts_mut(p, len) as *mut OwnedInner<[T], A>
+        };
+        let p = Self::allocate_for_layout(
+            alloc,
+            Layout::array::<T>(len).unwrap(),
+            mem_to_inner,
+        );
+        unsafe { NonNull::new_unchecked(p) }
+    }
 }
 
 impl<T, A> Owned<[MaybeUninit<T>], A>
 where
+    T: Sized,
     A: TrMalloc + Clone,
 {
     pub fn new_uninit_slice(len: usize, alloc: A) -> Self {
         unsafe {
-            let mut a = AllocForLayout::<A, (), [MaybeUninit<T>]>
-                ::allocate_for_inner_with_slice(len, alloc);
+            let mut a = Self::allocate_for_inner_with_slice(alloc, len);
             let inner = a.as_mut();
             Self::from_owned_inner_(inner)
         }
@@ -99,7 +116,7 @@ where
     pub fn leak(owned: Owned<T, A>) -> &'a mut T {
         let inner = unsafe { owned.0.as_ref() };
         core::mem::forget(owned);
-        unsafe { inner.data().as_mut() }
+        unsafe { inner.data_ptr().as_mut() }
     }
 }
 
@@ -159,7 +176,7 @@ where
     }
 
     pub const fn as_ptr(&self) -> *const T {
-        unsafe { self.0.as_ref().data().as_ptr() }
+        unsafe { self.0.as_ref().data_ptr().as_ptr() }
     }
 
     /// Get the offset within an `OwnedInner` for the payload behind a pointer.
@@ -187,6 +204,68 @@ where
     unsafe fn from_owned_inner_(inner: &mut OwnedInner<T, A>) -> Self {
         Self(NonNull::new(inner).expect("ptr cannot be null"))
     }
+
+    unsafe fn allocate_for_layout(
+        alloc: A,
+        value_layout: Layout,
+        mem_to_inner: impl FnOnce(*mut u8) -> *mut OwnedInner<T, A>,
+    ) -> *mut OwnedInner<T, A> {
+        let layout = inner_layout_for_value_layout(&alloc, value_layout);
+        let ptr = alloc
+            .allocate(layout)
+            .unwrap_or_else(|e|
+                handle_alloc_error_::<T, _>(e, layout));
+        unsafe { Self::initialize_inner(ptr, layout, mem_to_inner, alloc) }
+    }
+
+    /// Allocates an `OwnedInner<T, A>` with sufficient space for
+    /// a possibly-unsized inner value where the value has the layout provided,
+    /// returning an error if allocation fails.
+    ///
+    /// The function `mem_to_arcinner` is called with the data pointer
+    /// and must return back a (potentially fat)-pointer for the `ArcInner<T>`.
+    #[allow(unused)]
+    unsafe fn try_allocate_for_layout(
+        alloc: A,
+        value_layout: Layout,
+        mem_to_inner: impl FnOnce(*mut u8) -> *mut OwnedInner<T, A>,
+    ) -> Result<*mut OwnedInner<T, A>, A::Err> {
+        let layout = inner_layout_for_value_layout(&alloc, value_layout);
+        let ptr = alloc.allocate(layout)?;
+        let inner = unsafe {
+            Self::initialize_inner(ptr, layout, mem_to_inner, alloc)
+        };
+        Result::Ok(inner)
+    }
+
+    unsafe fn initialize_inner(
+        ptr: NonNull<[u8]>,
+        layout: Layout,
+        mem_to_inner: impl FnOnce(*mut u8) -> *mut OwnedInner<T, A>,
+        alloc: A,
+    ) -> *mut OwnedInner<T, A> {
+        let inner = mem_to_inner(ptr.as_non_null_ptr().as_ptr());
+        debug_assert_eq!(unsafe { Layout::for_value_raw(inner) }, layout);
+
+        unsafe { (&raw mut (*inner).alloc_).write(alloc); }
+        inner
+    }
+}
+
+/// Calculate layout for `ArcInner<T>` using the inner value's layout
+fn inner_layout_for_value_layout<A: TrMalloc>(
+    _alloc_hint_: &A,
+    layout: Layout,
+) -> Layout {
+    // Calculate layout using the given value layout.
+    // Previously, layout was calculated on the expression
+    // `&*(ptr as *const ArcInner<T>)`, but this created a misaligned
+    // reference (see #54908).
+    Layout::new::<OwnedInner<(), A>>()
+        .extend(layout)
+        .unwrap()
+        .0
+        .pad_to_align()
 }
 
 impl<T, A> Drop for Owned<T, A>
@@ -202,6 +281,13 @@ where
     }
 }
 
+impl<T, U, A> CoerceUnsized<Owned<U, A>> for Owned<T, A>
+where
+    T: ?Sized + Unsize<U>,
+    U: ?Sized,
+    A: TrMalloc + Clone,
+{}
+
 impl<T, A> Deref for Owned<T, A>
 where
     T: ?Sized,
@@ -210,7 +296,7 @@ where
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.0.as_ref().data().as_ref() }
+        unsafe { self.0.as_ref().data_ptr().as_ref() }
     }
 }
 
@@ -220,7 +306,7 @@ where
     A: TrMalloc + Clone,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.0.as_mut().data().as_mut() }
+        unsafe { self.0.as_mut().data_ptr().as_mut() }
     }
 }
 
@@ -320,6 +406,58 @@ where
     }
 }
 
+#[derive(Debug)]
+#[repr(C)]
+struct OwnedInner<T, A>
+where
+    T: ?Sized,
+    A: TrMalloc,
+{
+    alloc_: A,
+    data_: T,
+}
+
+impl<T, A> OwnedInner<T, A>
+where
+    T: ?Sized,
+    A: TrMalloc,
+{
+    pub const fn allocator(&self) -> &A {
+        &self.alloc_
+    }
+
+    pub const fn data_ptr(&self) -> NonNull<T> {
+        unsafe {
+            NonNull::new_unchecked(&self.data_ as *const T as *mut _)
+        }
+    }
+}
+
+impl<T, A> OwnedInner<T, A>
+where
+    T: ?Sized,
+    A: TrMalloc + Clone,
+{
+    pub fn release(
+        &mut self,
+        may_drop: impl FnOnce(NonNull<T>),
+    ) {
+        let alloc = self.allocator().clone();
+        unsafe {
+            let layout = Layout::for_value(self);
+            may_drop(self.data_ptr());
+            let ptr = self as *mut _;
+            let p = ptr::slice_from_raw_parts(
+                ptr as *mut u8,
+                layout.size(),
+            );
+            let ptr = NonNull::new_unchecked(p as *mut [u8]);
+            let res = alloc.deallocate(ptr, layout);
+            assert!(res.is_ok());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests_ {
     use std::{
@@ -327,8 +465,22 @@ mod tests_ {
         sync::{Arc, Weak},
         vec::Vec,
     };
-    use core_malloc::CoreAlloc;
+    use abs_mm::mem_alloc::TrMalloc;
+    use core_malloc::{
+        x_deps::abs_mm,
+        CoreAlloc, CoreAllocError,
+    };
     use super::{Owned, XtMallocOwned};
+
+    #[test]
+    fn coercion_should_work() {
+        let p: Owned<dyn TrMalloc<Err = CoreAllocError>, CoreAlloc> = 
+            Owned::new(CoreAlloc::new(), CoreAlloc::new());
+        drop(p);
+        let p: Owned<[usize], CoreAlloc> =
+            Owned::new([0usize; 10], CoreAlloc::new());
+        drop(p);
+    }
 
     #[test]
     fn drop_owned_should_drop_item() {

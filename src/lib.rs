@@ -5,12 +5,16 @@
 #![feature(slice_ptr_get)]
 #![feature(try_trait_v2)]
 
+// To allow smart pointers to do things like `Box::new(dyn x)`
+#![feature(coerce_unsized)]
+#![feature(unsize)]
+
 // We always pull in `std` during tests, because it's just easier
 // to write tests when you can assume you're on a capable platform
 #[cfg(test)]
 extern crate std;
 
-mod alloc_for_layout_;
+mod alloc_utils_;
 mod owned_;
 mod shared_;
 

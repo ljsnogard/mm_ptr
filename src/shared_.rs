@@ -1,10 +1,10 @@
 ﻿use core::{
-    alloc::Layout,
+    alloc::{Layout, LayoutError},
     borrow::Borrow,
     cell::UnsafeCell,
     cmp,
     fmt,
-    marker::Unsize,
+    marker::{PhantomPinned, Unsize},
     mem::{self, ManuallyDrop, MaybeUninit},
     ops::{CoerceUnsized, Deref},
     pin::Pin,
@@ -13,18 +13,20 @@
 };
 
 use abs_mm::{
+    as_pinned::TrAsPinned,
     mem_alloc::TrMalloc,
     res_man::{TrBoxed, TrShared, TrWeak},
 };
+use anylr::Either;
 use atomex::{AtomicCount, AtomexPtr};
 
 use crate::{
+    alloc_utils_::{handle_try_alloc_error_, TryAllocError},
     owned_::{Owned, XtMallocOwned},
-    alloc_utils_::handle_alloc_error_,
 };
 
 /// A atomic-reference-counted smart pointer for sharing the ownership of
-/// resource in multi-threaded environment.
+/// resource in a multi-threaded environment.
 #[derive(Debug)]
 pub struct Shared<T, A>(NonNull<SharedInner<T, A>>)
 where
@@ -37,16 +39,42 @@ where
     A: TrMalloc + Clone,
 {
     pub fn new(data: T, alloc: A) -> Self {
+        Self::try_new(data, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    pub fn try_new(data: T, alloc: A) -> Result<Self, TryAllocError<A>> {
+        let mem_to_inner = |mem| mem as *mut SharedInner<T, A>;
+        let value_layout = Layout::for_value(&data);
         unsafe {
-            let inner = Self::allocate_for_layout(
-                alloc,
-                Layout::for_value(&data),
-                |mem| mem as *mut SharedInner<T, A>,
-            );
+            let inner = Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?;
             let inner = NonNull::new_unchecked(inner);
             let inner_ref = inner.as_ref();
             ptr::write(inner_ref.data_ptr().as_ptr(), data);
-            Self::from_shared_inner_(inner_ref)
+            Result::Ok(Self::from_shared_inner_(inner_ref))
+        }
+    }
+
+    pub fn emplace<F>(emplace: F, alloc: A) -> Self
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        Self::try_emplace(emplace, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    pub fn try_emplace<F>(emplace: F, alloc: A) -> Result<Self, TryAllocError<A>>
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        let mem_to_inner = |mem| mem as *mut SharedInner<T, A>;
+        let value_layout = Layout::new::<T>();
+        unsafe {
+            let inner = Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?;
+            let mut inner = NonNull::new_unchecked(inner);
+            let data = (&mut inner.as_mut().data_) as *mut T as *mut MaybeUninit<T>;
+            emplace(&mut *data);
+            Result::Ok(Self::from_shared_inner_(inner.as_ref()))
         }
     }
 
@@ -78,36 +106,50 @@ where
     T: Sized,
     A: TrMalloc + Clone,
 {
-    pub fn new_slice(
+    pub fn new_slice<F>(len: usize, emplace_each: F, alloc: A) -> Self
+    where
+        F: FnMut(usize, &mut MaybeUninit<T>),
+    {
+        Self::try_new_slice(len, emplace_each, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<[T], A>(e))
+    }
+
+    pub fn try_new_slice<F>(
         len: usize,
-        mut init_each: impl FnMut(usize, &mut MaybeUninit<T>),
+        mut emplace_each: F,
         alloc: A,
-    ) -> Self {
+    ) -> Result<Self, TryAllocError<A>>
+    where
+        F: FnMut(usize, &mut MaybeUninit<T>),
+    {
         unsafe {
-            let p = Self::allocate_for_inner_with_slice(alloc, len);
+            let p = Self::try_allocate_for_inner_with_slice(alloc, len)?;
             let inner = p.as_ref();
             for (i, x) in inner.data_ptr().as_mut().iter_mut().enumerate() {
                 let m = x as *mut T as *mut MaybeUninit<T>;
-                init_each(i, &mut *m);
+                emplace_each(i, &mut *m);
             }
-            Self::from_shared_inner_(inner)
+            Result::Ok(Self::from_shared_inner_(inner))
         }
     }
 
-    unsafe fn allocate_for_inner_with_slice(
+    unsafe fn try_allocate_for_inner_with_slice(
         alloc: A,
         len: usize,
-    ) -> NonNull<SharedInner<[T], A>> {
+    ) -> Result<NonNull<SharedInner<[T], A>>, TryAllocError<A>> {
         let mem_to_inner = |mem: *mut u8| {
             let p = mem.cast::<T>();
             ptr::slice_from_raw_parts_mut(p, len) as *mut SharedInner<[T], A>
         };
-        let p = Self::allocate_for_layout(
-            alloc,
-            Layout::array::<T>(len).unwrap(),
-            mem_to_inner,
-        );
-        unsafe { NonNull::new_unchecked(p) }
+        let value_layout = match Layout::array::<T>(len) {
+            Result::Err(layout_err) =>
+                return Result::Err(Either::Left(layout_err)),
+            Result::Ok(layout) => layout,
+        };
+        let p = unsafe {
+            Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?
+        };
+        Result::Ok(unsafe { NonNull::new_unchecked(p) })
     }
 }
 
@@ -116,21 +158,37 @@ where
     A: TrMalloc + Clone,
 {
     pub fn new_uninit_slice(len: usize, alloc: A) -> Self {
+        Self::try_new_uninit_slice(len, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<[MaybeUninit<T>], A>(e))
+    }
+
+    pub fn try_new_uninit_slice(
+        len: usize,
+        alloc: A,
+    ) -> Result<Self, TryAllocError<A>> {
         unsafe {
-            let p = Self::allocate_for_inner_with_slice(alloc, len);
-            let inner = p.as_ref();
-            Self::from_shared_inner_(inner)
+            let mut a = Self::try_allocate_for_inner_with_slice(alloc, len)?;
+            let inner = a.as_mut();
+            Result::Ok(Self::from_shared_inner_(inner))
         }
     }
 
     pub fn new_zeroed_slice(len: usize, alloc: A) -> Self {
-        let x = Self::new_uninit_slice(len, alloc);
+        Self::try_new_zeroed_slice(len, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<[MaybeUninit<T>], A>(e))
+    }
+
+    pub fn try_new_zeroed_slice(
+        len: usize,
+        alloc: A,
+    ) -> Result<Self, Either<LayoutError, (Layout, A::Err)>> {
+        let x= Self::try_new_uninit_slice(len, alloc)?;
         let p = unsafe {
             // Safe because x is the only owner of the memory allocated
             &mut *(x.as_ptr() as *mut [MaybeUninit<T>])
         };
         p.iter_mut().for_each(|m| *m = MaybeUninit::zeroed());
-        x
+        Result::Ok(x)
     }
 }
 
@@ -139,33 +197,22 @@ where
     T: ?Sized,
     A: TrMalloc + Clone,
 {
-    unsafe fn allocate_for_layout(
-        alloc: A,
-        value_layout: Layout,
-        mem_to_inner: impl FnOnce(*mut u8) -> *mut SharedInner<T, A>,
-    ) -> *mut SharedInner<T, A> {
-        let layout = inner_layout_for_value_layout(&alloc, value_layout);
-        let ptr = alloc
-            .allocate(layout)
-            .unwrap_or_else(|e|
-                handle_alloc_error_::<T, _>(e, layout));
-        unsafe { Self::initialize_inner(ptr, layout, mem_to_inner, alloc) }
-    }
-
     /// Allocates an `SharedInner<T, A>` with sufficient space for
     /// a possibly-unsized inner value where the value has the layout provided,
     /// returning an error if allocation fails.
     ///
     /// The function `mem_to_arcinner` is called with the data pointer
     /// and must return back a (maybe fat)-pointer for the `SharedInner<T>`.
-    #[allow(unused)]
     unsafe fn try_allocate_for_layout(
         alloc: A,
         value_layout: Layout,
         mem_to_inner: impl FnOnce(*mut u8) -> *mut SharedInner<T, A>,
-    ) -> Result<*mut SharedInner<T, A>, A::Err> {
-        let layout = inner_layout_for_value_layout(&alloc, value_layout);
-        let ptr = alloc.allocate(layout)?;
+    ) -> Result<*mut SharedInner<T, A>, TryAllocError<A>> {
+        let layout = inner_layout_for_value_layout(&alloc, value_layout)
+            .map_err(|e| Either::Left(e))?;
+        let ptr = alloc
+            .allocate(layout)
+            .map_err(|e| Either::Right((layout, e)))?;
         let inner = unsafe {
             Self::initialize_inner(ptr, layout, mem_to_inner, alloc)
         };
@@ -193,16 +240,13 @@ where
 fn inner_layout_for_value_layout<A: TrMalloc + Clone>(
     _alloc_hint_: &A,
     layout: Layout,
-) -> Layout {
+) -> Result<Layout, LayoutError> {
     // Calculate layout using the given value layout.
     // Previously, layout was calculated on the expression
     // `&*(ptr as *const ArcInner<T>)`, but this created a misaligned
     // reference (see #54908).
-    Layout::new::<SharedInner<(), A>>()
-        .extend(layout)
-        .unwrap()
-        .0
-        .pad_to_align()
+    let (layout, _) = Layout::new::<SharedInner<(), A>>().extend(layout)?;
+    Result::Ok(layout.pad_to_align())
 }
 
 impl<'a, T, A> Shared<T, A>
@@ -242,16 +286,18 @@ where
     /// memory problems. For example, a double-free may occur if the
     /// function is called twice on the same raw pointer.
     pub unsafe fn try_from_raw(raw: *mut T) -> Option<Self> {
-        let offset = Self::data_offset_from_inner_base_(raw);
+        unsafe {
+            let offset = Self::data_offset_from_inner_base_(raw);
 
-        // Reverse the offset to find the original ArcInner.
-        let inner_ptr = raw.byte_sub(offset) as *mut SharedInner<T, A>;
-        let inner = inner_ptr.as_mut()?;
-        if inner.strong_count() != 1 || inner.weak_count() > 0 {
-            return Option::None;
+            // Reverse the offset to find the original ArcInner.
+            let inner_ptr = raw.byte_sub(offset) as *mut SharedInner<T, A>;
+            let inner = inner_ptr.as_mut()?;
+            if inner.strong_count() != 1 || inner.weak_count() > 0 {
+                return Option::None;
+            }
+            let inner_ptr = NonNull::new_unchecked(inner);
+            Option::Some(Self(inner_ptr))
         }
-        let inner_ptr = unsafe { NonNull::new_unchecked(inner) };
-        Option::Some(Self(inner_ptr))
     }
 
     /// Get the offset within an `SharedInner` for the payload behind a pointer.
@@ -487,6 +533,20 @@ where
     }
 }
 
+impl<'a, T, A> TrAsPinned<'a, T> for Pin<Shared<T, A>>
+where
+    Self: 'a,
+    T: 'a + ?Sized,
+    A: 'a + TrMalloc + Clone,
+{
+    fn as_pinned(self) -> Pin<&'a T> {
+        unsafe {
+            let t = self.as_ref().get_ref() as *const T;
+            Pin::new_unchecked(&*t)
+        }
+    }
+}
+
 unsafe impl<T, A> Send for Shared<T, A>
 where
     T: ?Sized + Send + Sync,
@@ -701,6 +761,7 @@ where
     T: ?Sized,
     A: TrMalloc + Clone,
 {
+    _pin_: PhantomPinned,
     alloc_: A,
     refc_: AtomicUsize,
     weak_: AtomicPtr<u8>,
@@ -795,6 +856,8 @@ where
     T: ?Sized,
     A: TrMalloc + Clone,
 {
+    _pinned_: PhantomPinned,
+
     /// A back track pointer for upgrading a Weak<T>. This pointer could be
     /// mutated to null when the back-tracking SharedInner instance is
     /// dropping.
@@ -810,6 +873,7 @@ where
 {
     pub fn new(opt_shared_inner: BackTrackSharedInner<T, A>) -> Self {
         WeakInner {
+            _pinned_: PhantomPinned,
             back_track_: UnsafeCell::new(opt_shared_inner),
             weak_count_: AtomicCount::default(),
         }
@@ -852,10 +916,13 @@ where
 
 #[cfg(test)]
 mod tests_ {
-    use std::{ops::Deref, sync::Arc, vec::Vec};
+    extern crate alloc;
 
-    use abs_mm::mem_alloc::TrMalloc;
-    use core_malloc::{x_deps::abs_mm, CoreAlloc, CoreAllocError};
+    use alloc::{sync::Arc, vec::Vec};
+    use core::ops::Deref; 
+
+    use abs_mm::mem_alloc::{CoreAlloc, CoreAllocError, TrMalloc};
+
     use super::{Shared, XtMallocShared};
 
     #[test]

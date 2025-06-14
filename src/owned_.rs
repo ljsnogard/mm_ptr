@@ -1,9 +1,9 @@
 ﻿use core::{
-    alloc::Layout,
+    alloc::{Layout, LayoutError},
     borrow::{Borrow, BorrowMut},
     cmp,
     fmt,
-    marker::Unsize,
+    marker::{PhantomPinned, Unsize},
     mem::{self, MaybeUninit},
     ops::{CoerceUnsized, Deref, DerefMut},
     pin::Pin,
@@ -11,15 +11,16 @@
 };
 
 use abs_mm::{
+    as_pinned::{TrAsPinned, TrAsPinnedMut},
     mem_alloc::TrMalloc,
     res_man::{TrBoxed, TrUnique},
 };
+use anylr::Either;
 
-use crate::alloc_utils_::handle_alloc_error_;
+use crate::alloc_utils_::{handle_try_alloc_error_, TryAllocError};
 
-// type OwnedInner<T, A> = Inner<A, (), T>;
-
-/// A smart pointer with specified allocator.
+/// A smart pointer that owns the resource managed by the specified allocator,
+/// like a `Box<T>`, and resource can be emplaced during construction.
 #[derive(Debug)]
 pub struct Owned<T, A>(NonNull<OwnedInner<T, A>>)
 where
@@ -32,16 +33,41 @@ where
     A: TrMalloc + Clone,
 {
     pub fn new(data: T, alloc: A) -> Self {
+        Self::try_new(data, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    pub fn try_new(data: T, alloc: A) -> Result<Self, TryAllocError<A>> {
         let mem_to_inner = |mem| { mem as *mut OwnedInner<T, A> };
+        let value_layout = Layout::for_value(&data);
         unsafe {
-            let inner = Self::allocate_for_layout(
-                alloc,
-                Layout::for_value(&data),
-                mem_to_inner
-            );
+            let inner = Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?;
             let inner = &mut *inner;
             inner.data_ptr().as_ptr().write(data);
-            Self::from_owned_inner_(inner)
+            Result::Ok(Self::from_owned_inner_(inner))
+        }
+    }
+
+    pub fn emplace<F>(emplace: F, alloc: A) -> Self
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        Self::try_emplace(emplace, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    pub fn try_emplace<F>(emplace: F, alloc: A) -> Result<Self, TryAllocError<A>>
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        let mem_to_inner = |mem| { mem as *mut OwnedInner<T, A> };
+        let value_layout = Layout::new::<T>();
+        unsafe {
+            let inner = Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?;
+            let inner = &mut *inner;
+            let data = &mut inner.data_ as *mut T as *mut MaybeUninit<T>;
+            emplace(&mut *data);
+            Result::Ok(Self::from_owned_inner_(inner))
         }
     }
 
@@ -55,36 +81,52 @@ where
     T: Sized,
     A: TrMalloc + Clone,
 {
-    pub fn new_slice(
+    pub fn new_slice<F>(len: usize, emplace_each: F, alloc: A) -> Self
+    where
+        F: FnMut(usize, &mut MaybeUninit<T>),
+    {
+        Self::try_new_slice(len, emplace_each, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<[T], A>(e))
+    }
+
+    pub fn try_new_slice<F>(
         len: usize,
-        mut init_each: impl FnMut(usize, &mut MaybeUninit<T>),
+        mut emplace_each: F,
         alloc: A,
-    ) -> Self {
+    ) -> Result<Self, TryAllocError<A>>
+    where
+        F: FnMut(usize, &mut MaybeUninit<T>),
+    {
+        let array_layout = match Layout::array::<T>(len) {
+            Result::Ok(x) => x,
+            Result::Err(layout_err) =>
+                return Result::Err(Either::Left(layout_err)),
+        };
         unsafe {
-            let mut a = Self::allocate_for_inner_with_slice(alloc, len);
+            let mut a = Self::try_allocate_for_inner_with_slice(alloc, len, array_layout)?;
             let inner = a.as_mut();
             for (u, x) in inner.data_ptr().as_mut().iter_mut().enumerate() {
                 let m = x as *mut T as *mut MaybeUninit<T>;
-                init_each(u, &mut *m);
+                emplace_each(u, &mut *m);
             }
-            Self::from_owned_inner_(inner)
+            Result::Ok(Self::from_owned_inner_(inner))
         }
     }
 
-    unsafe fn allocate_for_inner_with_slice(
+    unsafe fn try_allocate_for_inner_with_slice(
         alloc: A,
         len: usize,
-    ) -> NonNull<OwnedInner<[T], A>> {
+        array_layout: Layout,
+    ) -> Result<NonNull<OwnedInner<[T], A>>, Either<LayoutError, (Layout, A::Err)>> {
         let mem_to_inner = |mem: *mut u8| {
             let p = mem.cast::<T>();
             ptr::slice_from_raw_parts_mut(p, len) as *mut OwnedInner<[T], A>
         };
-        let p = Self::allocate_for_layout(
-            alloc,
-            Layout::array::<T>(len).unwrap(),
-            mem_to_inner,
-        );
-        unsafe { NonNull::new_unchecked(p) }
+        let value_layout = array_layout;
+        let p = unsafe {
+            Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?
+        };
+        Result::Ok(unsafe { NonNull::new_unchecked(p) })
     }
 }
 
@@ -94,17 +136,34 @@ where
     A: TrMalloc + Clone,
 {
     pub fn new_uninit_slice(len: usize, alloc: A) -> Self {
+        Self::try_new_uninit_slice(len, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<[MaybeUninit<T>], A>(e))
+    }
+
+    pub fn try_new_uninit_slice(
+        len: usize,
+        alloc: A,
+    ) -> Result<Self, TryAllocError<A>> {
+        let array_layout = Layout::array::<T>(len).unwrap();
         unsafe {
-            let mut a = Self::allocate_for_inner_with_slice(alloc, len);
+            let mut a = Self::try_allocate_for_inner_with_slice(alloc, len, array_layout)?;
             let inner = a.as_mut();
-            Self::from_owned_inner_(inner)
+            Result::Ok(Self::from_owned_inner_(inner))
         }
     }
 
     pub fn new_zeroed_slice(len: usize, alloc: A) -> Self {
-        let mut x = Self::new_uninit_slice(len, alloc);
+        Self::try_new_zeroed_slice(len, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<[MaybeUninit<T>], A>(e))
+    }
+
+    pub fn try_new_zeroed_slice(
+        len: usize,
+        alloc: A,
+    ) -> Result<Self, Either<LayoutError, (Layout, A::Err)>> {
+        let mut x= Self::try_new_uninit_slice(len, alloc)?;
         x.iter_mut().for_each(|m| *m = MaybeUninit::zeroed());
-        x
+        Result::Ok(x)
     }
 }
 
@@ -142,7 +201,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use core_malloc::CoreAlloc;
+    /// use abs_mm::mem_alloc::CoreAlloc;
     /// use mm_ptr::{Owned, XtMallocOwned};
     ///
     /// let x = CoreAlloc::default().owned("hello".to_owned());
@@ -160,15 +219,13 @@ where
     /// // now dangling!
     /// ```
     pub unsafe fn from_raw(raw: *mut T) -> Owned<T, A> {
-        let offset = Self::data_offset_from_inner_base_(raw);
+        unsafe {
+            let offset = Self::data_offset_from_inner_base_(raw);
 
-        // Reverse the offset to find the original ArcInner.
-        let inner_ptr = raw.byte_sub(offset) as *mut OwnedInner<T, A>;
-        let x = inner_ptr.as_mut();
-        let Option::Some(inner) = x else {
-            panic!();
-        };
-        Self::from_owned_inner_(inner)
+            // Reverse the offset to find the original ArcInner.
+            let inner_ptr = raw.byte_sub(offset) as *mut OwnedInner<T, A>;
+            Self::from_owned_inner_(&mut *inner_ptr)
+        }
     }
 
     pub const fn malloc(&self) -> &A {
@@ -205,18 +262,18 @@ where
         Self(NonNull::new(inner).expect("ptr cannot be null"))
     }
 
-    unsafe fn allocate_for_layout(
-        alloc: A,
-        value_layout: Layout,
-        mem_to_inner: impl FnOnce(*mut u8) -> *mut OwnedInner<T, A>,
-    ) -> *mut OwnedInner<T, A> {
-        let layout = inner_layout_for_value_layout(&alloc, value_layout);
-        let ptr = alloc
-            .allocate(layout)
-            .unwrap_or_else(|e|
-                handle_alloc_error_::<T, _>(e, layout));
-        unsafe { Self::initialize_inner(ptr, layout, mem_to_inner, alloc) }
-    }
+    // unsafe fn allocate_for_layout(
+    //     alloc: A,
+    //     value_layout: Layout,
+    //     mem_to_inner: impl FnOnce(*mut u8) -> *mut OwnedInner<T, A>,
+    // ) -> *mut OwnedInner<T, A> {
+    //     let layout = inner_layout_for_value_layout(&alloc, value_layout);
+    //     let ptr = alloc
+    //         .allocate(layout)
+    //         .unwrap_or_else(|e|
+    //             handle_alloc_error_::<T, _>(e, layout));
+    //     unsafe { Self::initialize_inner(ptr, layout, mem_to_inner, alloc) }
+    // }
 
     /// Allocates an `OwnedInner<T, A>` with sufficient space for
     /// a possibly-unsized inner value where the value has the layout provided,
@@ -224,14 +281,16 @@ where
     ///
     /// The function `mem_to_arcinner` is called with the data pointer
     /// and must return back a (potentially fat)-pointer for the `ArcInner<T>`.
-    #[allow(unused)]
     unsafe fn try_allocate_for_layout(
         alloc: A,
         value_layout: Layout,
         mem_to_inner: impl FnOnce(*mut u8) -> *mut OwnedInner<T, A>,
-    ) -> Result<*mut OwnedInner<T, A>, A::Err> {
-        let layout = inner_layout_for_value_layout(&alloc, value_layout);
-        let ptr = alloc.allocate(layout)?;
+    ) -> Result<*mut OwnedInner<T, A>, Either<LayoutError, (Layout, A::Err)>> {
+        let layout = inner_layout_for_value_layout(&alloc, value_layout)
+            .map_err(|e| Either::Left(e))?;
+        let ptr = alloc
+            .allocate(layout)
+            .map_err(|e| Either::Right((layout, e)))?;
         let inner = unsafe {
             Self::initialize_inner(ptr, layout, mem_to_inner, alloc)
         };
@@ -252,20 +311,17 @@ where
     }
 }
 
-/// Calculate layout for `ArcInner<T>` using the inner value's layout
+/// Calculate layout for `OwnedInner<T>` using the inner value's layout
 fn inner_layout_for_value_layout<A: TrMalloc>(
     _alloc_hint_: &A,
     layout: Layout,
-) -> Layout {
+) -> Result<Layout, LayoutError> {
     // Calculate layout using the given value layout.
     // Previously, layout was calculated on the expression
     // `&*(ptr as *const ArcInner<T>)`, but this created a misaligned
     // reference (see #54908).
-    Layout::new::<OwnedInner<(), A>>()
-        .extend(layout)
-        .unwrap()
-        .0
-        .pad_to_align()
+    let (layout, _) = Layout::new::<OwnedInner<(), A>>().extend(layout)?;
+    Result::Ok(layout.pad_to_align())
 }
 
 impl<T, A> Drop for Owned<T, A>
@@ -378,6 +434,34 @@ where
     type Item = T;
 }
 
+impl<'a, T, A> TrAsPinned<'a, T> for Pin<Owned<T, A>>
+where
+    Self: 'a,
+    T: 'a + ?Sized,
+    A: 'a + TrMalloc + Clone,
+{
+    fn as_pinned(self) -> Pin<&'a T> {
+        unsafe {
+            let t = self.as_ref().get_ref() as *const T;
+            Pin::new_unchecked(&*t)
+        }
+    }
+}
+
+impl<'a, T, A> TrAsPinnedMut<'a, T> for Pin<Owned<T, A>>
+where
+    Self: 'a,
+    T: 'a + ?Sized,
+    A: 'a + TrMalloc + Clone,
+{
+    fn as_pinned_mut(mut self) -> Pin<&'a mut T> {
+        unsafe {
+            let t = self.as_mut().get_unchecked_mut() as *mut T;
+            Pin::new_unchecked(&mut *t)
+        }
+    }
+}
+
 unsafe impl<T, A> Send for Owned<T, A>
 where
     T: ?Sized + Send,
@@ -413,6 +497,7 @@ where
     T: ?Sized,
     A: TrMalloc,
 {
+    _pin_: PhantomPinned,
     alloc_: A,
     data_: T,
 }
@@ -465,11 +550,8 @@ mod tests_ {
         sync::{Arc, Weak},
         vec::Vec,
     };
-    use abs_mm::mem_alloc::TrMalloc;
-    use core_malloc::{
-        x_deps::abs_mm,
-        CoreAlloc, CoreAllocError,
-    };
+    use abs_mm::mem_alloc::{CoreAlloc, CoreAllocError, TrMalloc};
+
     use super::{Owned, XtMallocOwned};
 
     #[test]

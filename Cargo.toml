@@ -1,7 +1,7 @@
 ﻿[package]
 name = "mm_ptr"
 version = "0.1.2"
-edition = "2021"
+edition = "2024"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
 description = "Smart pointers implementing abs_mm"
@@ -13,10 +13,8 @@ readme = "README.md"
 
 [dependencies]
 abs_mm = { git = "https://github.com/ljsnogard/abs_mm.git", branch = "dev/0.1.2" }
+anylr = { git = "https://github.com/ljsnogard/anylr.rs.git", branch = "main" }
 atomex = { git = "https://github.com/ljsnogard/atomex-rs.git", branch = "dev/0.1.1" }
-
-[dev-dependencies]
-core_malloc = { git = "https://github.com/ljsnogard/core_malloc.git", branch = "dev/0.1.2" }
 
 log = { version = "0.4.*" }
 env_logger = { version = "0.11.*" }

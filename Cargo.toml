@@ -12,9 +12,9 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_mm = { git = "https://github.com/ljsnogard/abs_mm.git", branch = "dev/0.1.2" }
-anylr = { git = "https://github.com/ljsnogard/anylr.rs.git", branch = "main" }
-atomex = { git = "https://github.com/ljsnogard/atomex-rs.git", branch = "dev/0.1.1" }
+abs_mm = { version = "0.1.2" }
+anylr = { version = "0.1.0" }
+atomex = { version = "0.1.1" }
 
 log = { version = "0.4.*" }
 env_logger = { version = "0.11.*" }

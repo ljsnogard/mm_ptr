@@ -38,29 +38,57 @@ where
     T: Sized,
     A: TrMalloc + Clone,
 {
+    #[inline]
     pub fn new(data: T, alloc: A) -> Self {
         Self::try_new(data, alloc)
             .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
     }
 
+    #[inline]
     pub fn try_new(data: T, alloc: A) -> Result<Self, TryAllocError<A>> {
-        let mem_to_inner = |mem| mem as *mut SharedInner<T, A>;
-        let value_layout = Layout::for_value(&data);
-        unsafe {
-            let inner = Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?;
-            let inner = NonNull::new_unchecked(inner);
-            let inner_ref = inner.as_ref();
-            ptr::write(inner_ref.data_ptr().as_ptr(), data);
-            Result::Ok(Self::from_shared_inner_(inner_ref))
-        }
+        let emplace = |m: &mut MaybeUninit<T>| {
+            m.write(data);
+        };
+        Self::try_emplace(emplace, alloc)
     }
 
+    #[inline]
     pub fn emplace<F>(emplace: F, alloc: A) -> Self
     where
         F: FnOnce(&mut MaybeUninit<T>),
     {
         Self::try_emplace(emplace, alloc)
             .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    #[inline]
+    pub fn pin(data: T, alloc: A) -> Pin<Self> {
+        let emplace = |m: &mut MaybeUninit<T>| {
+            m.write(data);
+        };
+        Self::try_pin_emplace(emplace, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    #[inline]
+    pub fn pin_emplace<F>(emplace: F, alloc: A) -> Pin<Self>
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        Self::try_pin_emplace(emplace, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    #[inline]
+    pub fn try_pin_emplace<F>(
+        emplace: F,
+        alloc: A,
+    ) -> Result<Pin<Self>, TryAllocError<A>>
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        let x = Self::try_emplace(emplace, alloc)?;
+        Result::Ok(unsafe { Pin::new_unchecked(x) } )
     }
 
     pub fn try_emplace<F>(emplace: F, alloc: A) -> Result<Self, TryAllocError<A>>
@@ -78,11 +106,7 @@ where
         }
     }
 
-    pub fn pin(data: T, alloc: A) -> Pin<Self> {
-        unsafe { Pin::new_unchecked(Self::new(data, alloc)) }
-    }
-
-    #[inline(always)]
+    #[inline]
     pub fn into_inner(self) -> Option<T> {
         self.try_into_inner().ok()
     }

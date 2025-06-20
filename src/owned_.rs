@@ -4,7 +4,7 @@
     cmp,
     fmt,
     marker::{PhantomPinned, Unsize},
-    mem::{self, MaybeUninit},
+    mem::{self, ManuallyDrop, MaybeUninit},
     ops::{CoerceUnsized, Deref, DerefMut},
     pin::Pin,
     ptr::{self, NonNull}
@@ -32,28 +32,59 @@ where
     T: Sized,
     A: TrMalloc + Clone,
 {
+    #[inline]
     pub fn new(data: T, alloc: A) -> Self {
-        Self::try_new(data, alloc)
+        let emplace = |m: &mut MaybeUninit<T>| {
+            m.write(data);
+        };
+        Self::try_emplace(emplace, alloc)
             .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
     }
 
+    #[inline]
     pub fn try_new(data: T, alloc: A) -> Result<Self, TryAllocError<A>> {
-        let mem_to_inner = |mem| { mem as *mut OwnedInner<T, A> };
-        let value_layout = Layout::for_value(&data);
-        unsafe {
-            let inner = Self::try_allocate_for_layout(alloc, value_layout, mem_to_inner)?;
-            let inner = &mut *inner;
-            inner.data_ptr().as_ptr().write(data);
-            Result::Ok(Self::from_owned_inner_(inner))
-        }
+        let emplace = |m: &mut MaybeUninit<T>| {
+            m.write(data);
+        };
+        Self::try_emplace(emplace, alloc)
     }
 
+    #[inline]
     pub fn emplace<F>(emplace: F, alloc: A) -> Self
     where
         F: FnOnce(&mut MaybeUninit<T>),
     {
         Self::try_emplace(emplace, alloc)
             .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    #[inline]
+    pub fn pin(data: T, alloc: A) -> Pin<Self> {
+        let emplace = |m: &mut MaybeUninit<T>| {
+            m.write(data);
+        };
+        Self::pin_emplace(emplace, alloc)
+    }
+
+    #[inline]
+    pub fn pin_emplace<F>(emplace: F, alloc: A) -> Pin<Self>
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        Self::try_pin_emplace(emplace, alloc)
+            .unwrap_or_else(|e| handle_try_alloc_error_::<T, A>(e))
+    }
+
+    #[inline]
+    pub fn try_pin_emplace<F>(
+        emplace: F,
+        alloc: A,
+    ) -> Result<Pin<Self>, TryAllocError<A>>
+    where
+        F: FnOnce(&mut MaybeUninit<T>),
+    {
+        let x = Self::try_emplace(emplace, alloc)?;
+        Result::Ok(unsafe { Pin::new_unchecked(x) } )
     }
 
     pub fn try_emplace<F>(emplace: F, alloc: A) -> Result<Self, TryAllocError<A>>
@@ -71,8 +102,14 @@ where
         }
     }
 
-    pub fn pin(data: T, alloc: A) -> Pin<Self> {
-        unsafe { Pin::new_unchecked(Self::new(data, alloc)) }
+    pub fn into_inner(self) -> T {
+        unsafe {
+            let mut this = ManuallyDrop::new(self);
+            let owned_inner = this.0.as_mut();
+            let data = owned_inner.data_ptr().as_ptr().read();
+            owned_inner.release(|_| ());
+            data
+        }
     }
 }
 
@@ -569,6 +606,17 @@ mod tests_ {
         let u = CoreAlloc::new().owned(Arc::new(0usize));
         let w = Arc::downgrade(u.deref());
         drop(u);
+        assert!(w.upgrade().is_none());
+    }
+
+    #[test]
+    fn into_inner_should_not_drop_item() {
+        let u = CoreAlloc::new().owned(Arc::new(0usize));
+        let w = Arc::downgrade(u.deref());
+        assert_eq!(w.strong_count(), 1);
+        let x = u.into_inner();
+        assert_eq!(w.strong_count(), 1);
+        drop(x);
         assert!(w.upgrade().is_none());
     }
 

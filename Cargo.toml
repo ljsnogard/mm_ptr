@@ -15,6 +15,3 @@ readme = "README.md"
 abs_mm = { version = "0.1.2" }
 anylr = { version = "0.1.0" }
 atomex = { version = "0.1.1" }
-
-log = { version = "0.4.*" }
-env_logger = { version = "0.11.*" }

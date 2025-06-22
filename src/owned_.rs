@@ -568,12 +568,12 @@ where
         unsafe {
             let layout = Layout::for_value(self);
             may_drop(self.data_ptr());
-            let ptr = self as *mut _;
-            let p = ptr::slice_from_raw_parts(
-                ptr as *mut u8,
+
+            let ptr = ptr::slice_from_raw_parts_mut(
+                self as *mut _ as *mut u8,
                 layout.size(),
             );
-            let ptr = NonNull::new_unchecked(p as *mut [u8]);
+            let ptr = NonNull::new_unchecked(ptr);
             let res = alloc.deallocate(ptr, layout);
             assert!(res.is_ok());
         }

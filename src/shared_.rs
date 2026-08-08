@@ -870,23 +870,23 @@ where
         unsafe { NonNull::new_unchecked(&mut (*this_mut).data_) }
     }
 
-    #[inline]
-    unsafe fn from_p_alloc_(
-        p_alloc: *const A,
-        data: *const T,
-    ) -> *const SharedInner<T, A> {
-        let offset_alloc = mem::offset_of!(SharedInner<T, A>, alloc_);
-        let offset_data = mem::offset_of!(SharedInner<(), A>, data_);
+    // #[inline]
+    // unsafe fn from_p_alloc_(
+    //     p_alloc: *const A,
+    //     data: *const T,
+    // ) -> *const SharedInner<T, A> {
+    //     let offset_alloc = mem::offset_of!(SharedInner<T, A>, alloc_);
+    //     let offset_data = mem::offset_of!(SharedInner<(), A>, data_);
 
-        debug_assert!(offset_data >= offset_alloc);
-        debug_assert_eq!(offset_alloc, 0usize);
-        debug_assert_eq!(mem::size_of::<SharedInner<(), A>>(), offset_data);
+    //     debug_assert!(offset_data >= offset_alloc);
+    //     debug_assert_eq!(offset_alloc, 0usize);
+    //     debug_assert_eq!(mem::size_of::<SharedInner<(), A>>(), offset_data);
 
-        let p_inner = unsafe { p_alloc.byte_sub(offset_alloc) };
-        // let data = unsafe { p_alloc.byte_add(offset_data - offset_alloc) };
-        let metadata = ptr::metadata(data);
-        ptr::from_raw_parts(p_inner, metadata)
-    }
+    //     let p_inner = unsafe { p_alloc.byte_sub(offset_alloc) };
+    //     // let data = unsafe { p_alloc.byte_add(offset_data - offset_alloc) };
+    //     let metadata = ptr::metadata(data);
+    //     ptr::from_raw_parts(p_inner, metadata)
+    // }
 
     fn try_release_(
         &mut self,
@@ -955,6 +955,7 @@ where
 }
 
 /// The reason why the attempt to release SharedInner has failed.
+#[allow(dead_code)]
 enum ReleaseFailure {
     /// During attempt to release, an upgrade has succeeded and the strong count
     /// has increased.

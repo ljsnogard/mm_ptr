@@ -1,7 +1,9 @@
 ﻿#![no_std]
 
-#![feature(alloc_layout_extra)]
 #![feature(layout_for_ptr)]
+#![feature(ptr_alignment_type)]
+// #![feature(ptr_as_uninit)]
+#![feature(ptr_metadata)]
 #![feature(slice_ptr_get)]
 #![feature(try_trait_v2)]
 

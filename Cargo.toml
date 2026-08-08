@@ -12,6 +12,5 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_mm = { version = "0.1.2" }
-anylr = { version = "0.1.0" }
-atomex = { version = "0.1.1" }
+abs_mm = { path = "../abs_mm" }
+atomex = { git = "https://gitee.com/lino_snsalias/atomex-rs.git", branch = "dev/0.1.2" }

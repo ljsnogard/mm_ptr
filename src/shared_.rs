@@ -448,9 +448,16 @@ where
         if shared_inner.decrease_strong_count() > 1 {
             return;
         }
-        let may_drop = |p: NonNull<T>|
-            unsafe { ptr::drop_in_place(p.as_ptr()) };
-        shared_inner.try_release_(may_drop);
+        let may_drop = |p: NonNull<T>| unsafe { ptr::drop_in_place(p.as_ptr()) };
+        loop {
+            let opt_failure = shared_inner.try_release_(may_drop);
+            let Option::Some(failure) = opt_failure else {
+                return;
+            };
+            if matches!(failure, ReleaseFailure::Resurrected(_)) {
+                return;
+            }
+        }
     }
 }
 
@@ -722,12 +729,26 @@ where
         let Option::Some(mut p_inner) = self.inner_ else {
             return;
         };
+        const LAST_COUNT: usize = 1usize;
         let weak_inner = unsafe { p_inner.as_mut() };
-        let weak_count = weak_inner.decrease_weak_count();
-        if weak_count != 1 || !weak_inner.back_track_.is_empty() {
+        if weak_inner.decrease_weak_count() != LAST_COUNT {
             return;
         }
-        WeakInner::release_weak_inner(weak_inner);
+        // 极端情况下，当 SharedInner 和 WeakInner 同时引用数降为 0 时有可能导致
+        // WeakInner 泄露，所以必须等待一个确定信号来释放 WeakInner 即 backtrack
+        // 被 reset。
+        loop {
+            let re = weak_inner.back_track_.try_read(usize::MAX);
+            let Result::Err(p) = re else {
+                return; // SharedInner 还是存活的，所以由它来释放
+            };
+            debug_assert!(
+                p.is_null(),
+                "[Weak<T, A>::Drop] assumes WeakInner should drop after SharedInner is released.",
+            );
+            WeakInner::release_weak_inner(weak_inner);
+            return;
+        }
     }
 }
 
@@ -908,42 +929,40 @@ where
     ) -> Option<ReleaseFailure> {
         const MAX_ATTEMPT: usize = 4;
         let this = self as *mut _ as *mut u8;
-        loop {
-            // rc here may differ as its atomic.
-            let rc = self.refc_().val();
-            if rc > 0 {
-                break Option::Some(ReleaseFailure::Resurrected(rc));
-            }
-            let opt_weak_inner = unsafe { self.weak_().value().as_mut() };
-            let mut weak_inner_existing = false;
-            let mut opt_guard: Option<BackTrackGuard<'_, T, A>> = Option::None;
-            if let Option::Some(weak_inner) = opt_weak_inner {
-                weak_inner_existing = true;
-                if weak_inner.weak_count_usize() == 0 {
-                    WeakInner::release_weak_inner(weak_inner);
-                } else {
-                    opt_guard = weak_inner
-                        .back_track_
-                        .try_lock(self, MAX_ATTEMPT)
-                        .ok();
-                }
-            };
-            if weak_inner_existing && opt_guard.is_none() {
-                break Option::Some(ReleaseFailure::BacktrackBusy);
-            }
-            let alloc = self.allocator().clone();
-            let layout = Layout::for_value(self);
-            may_drop(self.data_ptr());
-
-            let ptr = unsafe { NonNull::new_unchecked(this) };
-            let res = unsafe { alloc.deallocate(ptr, layout)};
-            assert!(res.is_ok());
-
-            if let Option::Some(guard) = opt_guard {
-                guard.reset_back_track();
-            }
-            break Option::None;
+        // rc here may differ as its atomic.
+        let rc = self.refc_().val();
+        if rc > 0 {
+            return Option::Some(ReleaseFailure::Resurrected(rc));
         }
+        let opt_weak_inner = unsafe { self.weak_().value().as_mut() };
+        let mut weak_inner_alive = false;
+        let mut opt_guard: Option<BackTrackGuard<'_, T, A>> = Option::None;
+        if let Option::Some(weak_inner) = opt_weak_inner {
+            weak_inner_alive = true;
+            if weak_inner.weak_count_usize() == 0 {
+                WeakInner::release_weak_inner(weak_inner);
+            } else {
+                opt_guard = weak_inner
+                    .back_track_
+                    .try_lock(self, MAX_ATTEMPT)
+                    .ok();
+            }
+        };
+        if weak_inner_alive && opt_guard.is_none() {
+            return Option::Some(ReleaseFailure::BacktrackBusy);
+        }
+        let alloc = self.allocator().clone();
+        let layout = Layout::for_value(self);
+        may_drop(self.data_ptr());
+
+        let ptr = unsafe { NonNull::new_unchecked(this) };
+        let res = unsafe { alloc.deallocate(ptr, layout)};
+        assert!(res.is_ok());
+
+        if let Option::Some(guard) = opt_guard {
+            guard.reset_back_track();
+        }
+        Option::None
     }
 
     fn increase_strong_count(&self) -> usize {
@@ -1008,20 +1027,61 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.pointer_.load().is_none()
     }
 
-    // /// To calculate the address of WeakInner from the backtrack.
-    // ///
-    // /// # Safety
-    // /// This will only work when ALL backtrack instances are the field of WeakInner.
-    // unsafe fn weak_inner_(&self) -> &WeakInner<T, A> {
-    //     let offset = mem::offset_of!(WeakInner<T, A>, back_track_);
-    //     let this = self as *const Self;
-    //     let inner = unsafe { this.byte_sub(offset) as *const WeakInner<T, A> };
-    //     unsafe { inner.as_ref().unwrap() }
-    // }
+    /// To calculate the address of WeakInner from the backtrack.
+    ///
+    /// # Safety
+    /// This will only work when ALL backtrack instances are the field of WeakInner.
+    unsafe fn weak_inner_(&self) -> &WeakInner<T, A> {
+        let offset = mem::offset_of!(WeakInner<T, A>, back_track_);
+        let this = self as *const Self;
+        let inner = unsafe { this.byte_sub(offset) as *const WeakInner<T, A> };
+        unsafe { inner.as_ref().unwrap() }
+    }
+
+    /// 尝试读取 backtrack 中的地址，如果是正常的 SharedInner 地址就返回 Ok
+    /// 超出最大尝试或者是其他的值是返回 Err
+    pub fn try_read(
+        &self,
+        max_attempt: usize,
+    ) -> Result<&SharedInner<T, A>, *mut A> {
+        let offset_alloc = mem::offset_of!(SharedInner<T, A>, alloc_);
+        let locked_val = self.dangling_val_();
+        let weak_inner = unsafe { self.weak_inner_() };
+        let opt_p_shared_inner = weak_inner
+            .ptr_shared_
+            .map(|p| p.as_ptr());
+        let Option::Some(p_shared_inner) = opt_p_shared_inner else {
+            return Result::Err(ptr::null_mut())
+        };
+        let p_shared_inner_thin = p_shared_inner as *mut u8;
+
+        let mut current;
+        let mut c = 0usize;
+        loop {
+            current = self.pointer_.pointer();
+            if current.is_null() {
+                break;
+            }
+            c += 1usize;
+            if current == locked_val {
+                continue;
+            }
+            let deduced_p = unsafe { current.byte_sub(offset_alloc) as usize };
+            if deduced_p == p_shared_inner_thin as usize {
+                let shared_inner = unsafe { &*p_shared_inner };
+                return Result::Ok(shared_inner)
+            }
+            if c >= max_attempt {
+                break;
+            }
+        }
+        Result::Err(current)
+    }
 
     /// Try to acquire the backtrack guard by offering a correct reference to
     /// the SharedInner. This would work because when the guard is available

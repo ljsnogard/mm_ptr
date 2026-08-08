@@ -929,40 +929,45 @@ where
     ) -> Option<ReleaseFailure> {
         const MAX_ATTEMPT: usize = 4;
         let this = self as *mut _ as *mut u8;
-        // rc here may differ as its atomic.
-        let rc = self.refc_().val();
-        if rc > 0 {
-            return Option::Some(ReleaseFailure::Resurrected(rc));
-        }
-        let opt_weak_inner = unsafe { self.weak_().value().as_mut() };
-        let mut weak_inner_alive = false;
         let mut opt_guard: Option<BackTrackGuard<'_, T, A>> = Option::None;
-        if let Option::Some(weak_inner) = opt_weak_inner {
-            weak_inner_alive = true;
-            if weak_inner.weak_count_usize() == 0 {
-                WeakInner::release_weak_inner(weak_inner);
-            } else {
-                opt_guard = weak_inner
-                    .back_track_
-                    .try_lock(self, MAX_ATTEMPT)
-                    .ok();
+        loop {
+            // rc here may differ as its atomic.
+            let rc = self.refc_().val();
+            if rc > 0 {
+                break Option::Some(ReleaseFailure::Resurrected(rc));
             }
-        };
-        if weak_inner_alive && opt_guard.is_none() {
-            return Option::Some(ReleaseFailure::BacktrackBusy);
-        }
-        let alloc = self.allocator().clone();
-        let layout = Layout::for_value(self);
-        may_drop(self.data_ptr());
+            let opt_weak_inner = unsafe { self.weak_().value().as_mut() };
+            let mut weak_inner_alive = false;
+            if let Option::Some(weak_inner) = opt_weak_inner {
+                weak_inner_alive = true;
+                if weak_inner.weak_count_usize() == 0 {
+                    WeakInner::release_weak_inner(weak_inner);
+                } else {
+                    if opt_guard.is_none() {
+                        opt_guard = weak_inner
+                            .back_track_
+                            .try_lock(self, MAX_ATTEMPT)
+                            .ok();
+                        continue;
+                    }
+                }
+            };
+            if weak_inner_alive && opt_guard.is_none() {
+                return Option::Some(ReleaseFailure::BacktrackBusy);
+            }
+            let alloc = self.allocator().clone();
+            let layout = Layout::for_value(self);
+            may_drop(self.data_ptr());
 
-        let ptr = unsafe { NonNull::new_unchecked(this) };
-        let res = unsafe { alloc.deallocate(ptr, layout)};
-        assert!(res.is_ok());
+            let ptr = unsafe { NonNull::new_unchecked(this) };
+            let res = unsafe { alloc.deallocate(ptr, layout)};
+            assert!(res.is_ok());
 
-        if let Option::Some(guard) = opt_guard {
-            guard.reset_back_track();
+            if let Option::Some(guard) = opt_guard {
+                guard.reset_back_track();
+            }
+            break Option::None;
         }
-        Option::None
     }
 
     fn increase_strong_count(&self) -> usize {

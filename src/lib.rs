@@ -2,14 +2,16 @@
 
 #![feature(layout_for_ptr)]
 #![feature(ptr_alignment_type)]
-// #![feature(ptr_as_uninit)]
-// #![feature(ptr_metadata)]
 #![feature(slice_ptr_get)]
 #![feature(try_trait_v2)]
 
 // To allow smart pointers to do things like `Box::new(dyn x)`
 #![feature(coerce_unsized)]
 #![feature(unsize)]
+
+// To calculate the offset from DST in SharedInner
+// #![feature(ptr_as_uninit)]
+// #![feature(ptr_metadata)]
 
 // We always pull in `std` during tests, because it's just easier
 // to write tests when you can assume you're on a capable platform

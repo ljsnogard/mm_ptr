@@ -644,11 +644,12 @@ where
         let Option::Some(p_shared_inner) = weak_inner.ptr_shared_ else {
             return Result::Err(WeakUpgradeError::Destroyed);
         };
-        let shared_inner = unsafe { p_shared_inner.as_ref() };
-        let Result::Ok(guard) = weak_inner.back_track_.try_lock(shared_inner, MAX_ATTEMPT) else {
+        let p_shared_pointer = p_shared_inner.as_ptr();
+        let Result::Ok(guard) = weak_inner.back_track_.try_lock(p_shared_pointer, MAX_ATTEMPT) else {
             return Result::Err(WeakUpgradeError::Destructing);
         };
-        if !ptr::eq(guard.shared_inner(), shared_inner) {
+        let shared_inner = guard.shared_inner();
+        if !ptr::eq(shared_inner, p_shared_pointer) {
             return Result::Err(WeakUpgradeError::Unknown)
         };
         Result::Ok(Shared::from_shared_inner_(shared_inner))
@@ -663,16 +664,21 @@ where
             return Option::None; // This is not an normal memory state
         };
         let Option::Some(p_shared_inner) = weak_inner.ptr_shared_ else {
-            return Option::Some(0usize);
+            return Option::Some(0usize); // we can be sure that, SharedInner is gone.
         };
-        let shared_inner = unsafe { p_shared_inner.as_ref() };
-        let Result::Ok(guard) = weak_inner.back_track_.try_lock(shared_inner, MAX_ATTEMPT) else {
+        let p_shared_pointer = p_shared_inner.as_ptr();
+        let Result::Ok(guard) = weak_inner.back_track_.try_lock(p_shared_pointer, MAX_ATTEMPT) else {
             return Option::None;
         };
-        if !ptr::eq(guard.shared_inner(), shared_inner) {
+        // critical section is guarded from here
+        let shared_inner = guard.shared_inner();
+        if !ptr::eq(shared_inner, p_shared_pointer) {
             return Option::None;
         };
-        Option::Some(shared_inner.strong_count())
+        let c = Option::Some(shared_inner.strong_count());
+        drop(guard);
+        // critical section ends
+        c
     }
 
     pub fn weak_count(&self) -> usize {
@@ -861,6 +867,13 @@ where
         }
     }
 
+    #[inline]
+    fn sentinel_(shared_inner_ptr: *const Self) -> *mut A {
+        let offset = mem::offset_of!(SharedInner<T, A>, alloc_);
+        let p = unsafe { shared_inner_ptr.byte_add(offset) };
+        p as *const A as *mut A
+    }
+
     const fn allocator(&self) -> &A {
         &self.alloc_
     }
@@ -870,6 +883,7 @@ where
         unsafe { NonNull::new_unchecked(&mut (*this_mut).data_) }
     }
 
+    // /// Calculate the address of SharedInner<T, A> from a pointer to its `alloc_` field
     // #[inline]
     // unsafe fn from_p_alloc_(
     //     p_alloc: *const A,
@@ -998,57 +1012,27 @@ where
         self.pointer_.load().is_none()
     }
 
-    // fn weak_inner_(&self) -> &WeakInner<T, A> {
+    // /// To calculate the address of WeakInner from the backtrack.
+    // ///
+    // /// # Safety
+    // /// This will only work when ALL backtrack instances are the field of WeakInner.
+    // unsafe fn weak_inner_(&self) -> &WeakInner<T, A> {
     //     let offset = mem::offset_of!(WeakInner<T, A>, back_track_);
     //     let this = self as *const Self;
     //     let inner = unsafe { this.byte_sub(offset) as *const WeakInner<T, A> };
     //     unsafe { inner.as_ref().unwrap() }
     // }
 
-    // pub fn try_read(
-    //     &self,
-    //     max_attempt: usize,
-    // ) -> Result<&SharedInner<T, A>, *mut A> {
-    //     let offset_alloc = mem::offset_of!(SharedInner<T, A>, alloc_);
-    //     let locked_val = self.dangling_val_();
-    //     let weak_inner = unsafe { self.weak_inner_() };
-    //     let opt_p_shared_inner = weak_inner
-    //         .ptr_shared_
-    //         .map(|p| p.as_ptr());
-    //     let Option::Some(p_shared_inner) = opt_p_shared_inner else {
-    //         return Result::Err(ptr::null_mut())
-    //     };
-    //     let p_shared_inner_thin = p_shared_inner as *mut u8;
-
-    //     let mut current;
-    //     let mut c = 0usize;
-    //     loop {
-    //         current = self.pointer_.pointer();
-    //         if current.is_null() {
-    //             break;
-    //         }
-    //         c += 1usize;
-    //         if current == locked_val {
-    //             continue;
-    //         }
-    //         let deduced_p = unsafe { current.byte_sub(offset_alloc) as usize };
-    //         if deduced_p == p_shared_inner_thin as usize {
-    //             let shared_inner = unsafe { &*p_shared_inner };
-    //             return Result::Ok(shared_inner)
-    //         }
-    //         if c >= max_attempt {
-    //             break;
-    //         }
-    //     }
-    //     Result::Err(current)
-    // }
-
+    /// Try to acquire the backtrack guard by offering a correct reference to
+    /// the SharedInner. This would work because when the guard is available
+    /// the backtrack pointer stores the address of the `alloc_` field of the
+    /// `SharedInner` instance.
     pub fn try_lock<'a>(
         &'a self,
-        shared_inner: &'a SharedInner<T, A>,
+        p_shared_inner: *const SharedInner<T, A>,
         max_attempt: usize,
     ) -> Result<BackTrackGuard<'a, T, A>, Option<CmpxchResult<*mut A>>> {
-        let current = &shared_inner.alloc_ as *const A as *mut A;
+        let current = SharedInner::sentinel_(p_shared_inner);
         let locked_val = self.dangling_val_();
         assert_ne!(current, locked_val);
 
@@ -1061,8 +1045,11 @@ where
                 .pointer_
                 .try_once_compare_exchange_weak(current, expect, desire);
             if cmp_res.is_succ() {
-                let tk = BackTrackGuard::new(self, shared_inner);
-                return Result::Ok(tk)
+                unsafe {
+                    let shared_inner = &*p_shared_inner;
+                    let tk = BackTrackGuard::new(self, shared_inner);
+                    return Result::Ok(tk);
+                }
             }
             c += 1usize;
             result = Option::Some(cmp_res);

@@ -661,6 +661,9 @@ pub enum WeakUpgradeError {
     /// The instance owned by the `Shared<T>` is memory freed.
     Destroyed,
 
+    /// Racing condition
+    Contention,
+
     /// Fatal error, should panic.
     Unknown,
 }
@@ -670,6 +673,7 @@ impl fmt::Display for WeakUpgradeError {
         match self {
             WeakUpgradeError::Destructing => write!(f, "WeakUpgradeError::Destructing"),
             WeakUpgradeError::Destroyed => write!(f, "WeakUpgradeError::Destroyed"),
+            WeakUpgradeError::Contention => write!(f, "WeakUpgradeError::Contention"),
             WeakUpgradeError::Unknown => write!(f, "WeakUpgradeError::Unknown"),
         }
     }
@@ -693,12 +697,12 @@ where
         let Option::Some(weak_inner) = self.opt_weak_inner_() else {
             return Result::Err(WeakUpgradeError::Unknown);
         };
-        let Option::Some(p_shared_inner) = weak_inner.ptr_shared_ else {
-            return Result::Err(WeakUpgradeError::Destroyed);
-        };
-        let p_shared_pointer = p_shared_inner.as_ptr();
-        let Result::Ok(guard) = weak_inner.back_track_.try_lock(p_shared_pointer, MAX_ATTEMPT) else {
-            return Result::Err(WeakUpgradeError::Destructing);
+        let p_shared_pointer = weak_inner.ptr_shared_.as_ptr();
+        let res = weak_inner
+            .back_track_
+            .try_lock(p_shared_pointer, MAX_ATTEMPT);
+        let Result::Ok(guard) = res else {
+            return Result::Err(WeakUpgradeError::Contention);
         };
         let shared_inner = guard.shared_inner();
         if !ptr::eq(shared_inner, p_shared_pointer) {
@@ -715,11 +719,11 @@ where
         let Option::Some(weak_inner) = self.opt_weak_inner_() else {
             return Option::None; // This is not an normal memory state
         };
-        let Option::Some(p_shared_inner) = weak_inner.ptr_shared_ else {
-            return Option::Some(0usize); // we can be sure that, SharedInner is gone.
-        };
-        let p_shared_pointer = p_shared_inner.as_ptr();
-        let Result::Ok(guard) = weak_inner.back_track_.try_lock(p_shared_pointer, MAX_ATTEMPT) else {
+        let p_shared_pointer = weak_inner.ptr_shared_.as_ptr();
+        let res = weak_inner
+            .back_track_
+            .try_lock(p_shared_pointer, MAX_ATTEMPT);
+        let Result::Ok(guard) = res else {
             return Option::None;
         };
         // critical section is guarded from here
@@ -783,18 +787,21 @@ where
         // 极端情况下，当 SharedInner 和 WeakInner 同时引用数降为 0 时有可能导致
         // WeakInner 泄露，所以必须等待一个确定信号来释放 WeakInner 即 backtrack
         // 被 reset。
-        loop {
+        {
             let re = weak_inner.back_track_.try_read(usize::MAX);
             let Result::Err(p) = re else {
                 return; // SharedInner 还是存活的，所以由它来释放
             };
+            if weak_inner.weak_count_usize() != LAST_COUNT {
+                return; // 可能有其他 Shared::downgrade()
+            }
             debug_assert!(
                 p.is_null(),
                 "[Weak<T, A>::Drop] assumes WeakInner should drop after SharedInner is released.",
             );
             weak_inner.decrease_weak_count();
             WeakInner::release_weak_inner(weak_inner);
-            return;
+            // return;
         }
     }
 }
@@ -919,11 +926,13 @@ where
     T: ?Sized,
     A: TrMalloc + Clone,
 {
+    #[allow(clippy::mut_from_ref)]
     fn refc_(&self) -> AtomicCount<usize, &mut AtomicUsize> {
         let this_mut = self as *const _ as *mut Self;
         unsafe { AtomicCount::new(&mut (*this_mut).refc_) }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn weak_(
         &self,
     ) -> AtomexPtr<WeakInner<T, A>, &mut AtomicPtr<WeakInner<T, A>>> {
@@ -1050,13 +1059,13 @@ enum ReleaseFailure {
     BacktrackBusy,
 }
 
-/// Wrapping an atomic pointer, as a field of WeakInner to trace back to the
-/// SharedInner.
+/// 在 WeakInner 中反向追踪 SharedInner 的原子指针。有三种可能的状态，
+/// 空值：SharedInner 已释放
+/// dangling_val_：指向自身地址 `BackTrackSharedInner`，用于表示锁已被获取。
+/// 以及真正的 `SharedInner` 地址
 ///
-/// However, a pointer to SharedInner could be a fat pointer so it can't fit
-/// into an atomic pointer directly. So the work around here is to trace back
-/// to the allocator in the SharedInner, and then calculate the pointer to the
-/// desired SharedInner.
+/// 由于原子指针不能是胖指针，所以变通地使用 `&shared_inner_.alloc_` 来作为
+/// 声明类型值
 struct BackTrackSharedInner<T, A>
 where
     T: ?Sized,
@@ -1104,12 +1113,9 @@ where
         let offset_alloc = mem::offset_of!(SharedInner<T, A>, alloc_);
         let locked_val = self.dangling_val_();
         let weak_inner = unsafe { self.weak_inner_() };
-        let opt_p_shared_inner = weak_inner
+        let p_shared_inner = weak_inner
             .ptr_shared_
-            .map(|p| p.as_ptr());
-        let Option::Some(p_shared_inner) = opt_p_shared_inner else {
-            return Result::Err(ptr::null_mut())
-        };
+            .as_ptr();
         let p_shared_inner_thin = p_shared_inner as *mut u8;
 
         let mut current;
@@ -1258,7 +1264,7 @@ where
     /// dropping.
     back_track_: BackTrackSharedInner<T, A>,
     weak_count_: AtomicCount<usize>,
-    ptr_shared_: Option<NonNull<SharedInner<T, A>>>,
+    ptr_shared_: NonNull<SharedInner<T, A>>,
 }
 
 impl<T, A> WeakInner<T, A>
@@ -1273,7 +1279,7 @@ where
             _pinned_: PhantomPinned,
             back_track_: BackTrackSharedInner::new(shared_inner),
             weak_count_: AtomicCount::new(AtomicUsize::new(0usize)),
-            ptr_shared_: Option::Some(p),
+            ptr_shared_: p,
         }
     }
 

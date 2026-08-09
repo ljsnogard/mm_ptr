@@ -6,7 +6,7 @@
     error,
     fmt,
     marker::{PhantomData, PhantomPinned, Unsize},
-    mem::{self, Alignment, ManuallyDrop, MaybeUninit},
+    mem::{self, Alignment, MaybeUninit},
     ops::{CoerceUnsized, Deref, Try},
     pin::Pin,
     ptr::{self, NonNull},
@@ -118,22 +118,59 @@ where
         }
     }
 
-    pub fn try_into_inner(self) -> Result<T, Option<Self>> {
+    pub fn try_into_inner(self) -> Result<T, Self> {
         const LAST_COUNT: usize = 1usize;
-        if Shared::strong_count(&self) > LAST_COUNT {
-            return Result::Err(Option::Some(self));
+        const MAX_ATTEMPT: usize = 2usize;
+        let mut opt_guard = Option::None;
+        let mut i = 0usize;
+        let racing_weak = self.racing_weak_().as_ptr();
+        // Though `Shared::downgrade` accepts `&Shared<T>`, it is not possible when
+        // strong count is 1 while other alias are still alive.
+        // This is prevented by the compiler.
+        // So it is not neccessary to acquire a guard from WeakInner backtrack.
+        loop {
+            if Shared::strong_count(&self) > LAST_COUNT {
+                break;
+            }
+            let mut weak_inner_alive = false;
+            let shared_inner = unsafe { self.0.as_ref() };
+            if let Option::Some(p_weak_inner) = shared_inner.weak_().load() {
+                // very unlikely in racing condition, only when this is poisoned.
+                if p_weak_inner.as_ptr() == racing_weak {
+                    if i > MAX_ATTEMPT {
+                        break;
+                    } else {
+                        i += 1usize;
+                        continue;
+                    }
+                }
+                weak_inner_alive = true;
+                let weak_inner = unsafe { p_weak_inner.as_ref() };
+                if weak_inner.weak_count_usize() > 0usize {
+                    opt_guard = weak_inner
+                        .back_track_
+                        .try_lock(shared_inner, MAX_ATTEMPT)
+                        .ok();
+                }
+            }
+            if opt_guard.is_some() || !weak_inner_alive {
+                let mut this = MaybeUninit::new(self);
+                let shared_inner = unsafe { &mut this.assume_init_mut().0.as_mut() };
+                let data = unsafe {
+                    let data = shared_inner.data_ptr().as_ptr().read();
+                    MaybeUninit::new(data)
+                };
+                let strong_count = shared_inner.decrease_strong_count();
+                debug_assert_eq!(strong_count, LAST_COUNT);
+                let may_err = shared_inner.try_release_(|_| (), opt_guard);
+                if may_err.is_none() {
+                    return Result::Ok(unsafe { data.assume_init() });
+                } else {
+                    return Result::Err(unsafe { this.assume_init() });
+                }
+            }
         }
-        let mut this = ManuallyDrop::new(self);
-        let shared_inner = unsafe { this.0.as_mut() };
-        let data = unsafe { shared_inner.data_ptr().as_ptr().read() };
-        let strong_count = shared_inner.decrease_strong_count();
-        debug_assert_eq!(strong_count, LAST_COUNT);
-        let may_err = shared_inner.try_release_(|_| ());
-        if may_err.is_none() {
-            Result::Ok(data)
-        } else {
-            Result::Err(Option::None)
-        }
+        Result::Err(self)
     }
 }
 
@@ -382,17 +419,13 @@ where
         let shared_inner = unsafe { shared.0.as_ref() };
         let atom_weak = shared_inner.weak_();
         let p_weak_inner: * mut WeakInner<T, A>;
-        let atom_guard = unsafe {
-            let ptr = shared_inner
-                as *const _
-                as *mut SharedInner<T, A>
-                as *mut WeakInner<T, A>;
-            NonNull::new_unchecked(ptr)
-        };
+        let racing_weak = shared.racing_weak_();
         loop {
-            let r = atom_weak.try_spin_init(atom_guard);
+            let r = atom_weak.try_spin_init(racing_weak);
             if let Result::Err(p) = r {
-                if !ptr::eq(p.as_ptr(), atom_guard.as_ptr()) {
+                // Judge if the WeakInner is locked or initialized by other.
+                // If initialized by other, it is a pointer other than dangling
+                if !ptr::eq(p.as_ptr(), racing_weak.as_ptr()) {
                     p_weak_inner = p.as_ptr();
                     break;
                 }
@@ -402,7 +435,7 @@ where
                 break;
             }
         }
-        assert!(!p_weak_inner.is_null());
+        assert!(!p_weak_inner.is_null() && p_weak_inner != racing_weak.as_ptr());
         Weak::<T, A>::from_weak_inner_(unsafe { &*p_weak_inner })
     }
 
@@ -436,6 +469,18 @@ where
         // Safe because it is from allocated.
         unsafe { self.0.as_ref() }
     }
+
+    /// Create an impossible WeakInner pointer to indicate that the WeakInner
+    /// pointer is under racing conditioni.
+    fn racing_weak_(&self) -> NonNull<WeakInner<T, A>> {
+        unsafe {
+            NonNull::new_unchecked(self.shared_inner_()
+                as *const _
+                as *mut SharedInner<T, A>
+                as *mut WeakInner<T, A>
+            )
+        }
+    }
 }
 
 impl<T, A> Drop for Shared<T, A>
@@ -450,7 +495,7 @@ where
         }
         let may_drop = |p: NonNull<T>| unsafe { ptr::drop_in_place(p.as_ptr()) };
         loop {
-            let opt_failure = shared_inner.try_release_(may_drop);
+            let opt_failure = shared_inner.try_release_(may_drop, Option::None);
             let Option::Some(failure) = opt_failure else {
                 return;
             };
@@ -731,7 +776,8 @@ where
         };
         const LAST_COUNT: usize = 1usize;
         let weak_inner = unsafe { p_inner.as_mut() };
-        if weak_inner.decrease_weak_count() != LAST_COUNT {
+        if weak_inner.weak_count_usize() != LAST_COUNT {
+            weak_inner.decrease_weak_count();
             return;
         }
         // 极端情况下，当 SharedInner 和 WeakInner 同时引用数降为 0 时有可能导致
@@ -746,6 +792,7 @@ where
                 p.is_null(),
                 "[Weak<T, A>::Drop] assumes WeakInner should drop after SharedInner is released.",
             );
+            weak_inner.decrease_weak_count();
             WeakInner::release_weak_inner(weak_inner);
             return;
         }
@@ -926,10 +973,10 @@ where
     fn try_release_(
         &mut self,
         may_drop: impl FnOnce(NonNull<T>),
+        mut opt_guard: Option<BackTrackGuard<'_, T, A>>,
     ) -> Option<ReleaseFailure> {
         const MAX_ATTEMPT: usize = 4;
         let this = self as *mut _ as *mut u8;
-        let mut opt_guard: Option<BackTrackGuard<'_, T, A>> = Option::None;
         loop {
             // rc here may differ as its atomic.
             let rc = self.refc_().val();

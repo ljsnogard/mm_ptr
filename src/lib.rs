@@ -1,6 +1,8 @@
 ﻿#![no_std]
 
-#![feature(layout_for_ptr)]
+// the feature `layout_for_ptr` has been stable since 1.99.0 and no longer requires an attribute to enable
+// #![feature(layout_for_ptr)]
+
 #![feature(ptr_alignment_type)]
 #![feature(slice_ptr_get)]
 #![feature(try_trait_v2)]

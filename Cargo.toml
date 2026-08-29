@@ -12,5 +12,5 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_mm = { git = "https://gitee.com/lino_snsalias/abs_mm.git", branch = "dev/0.2.0" }
+abs_mm = { git = "https://gitee.com/lino_snsalias/abs_mm.git", version = "0.2.1", branch = "dev/0.2.1" }
 atomex = { git = "https://gitee.com/lino_snsalias/atomex-rs.git", branch = "dev/0.1.2" }

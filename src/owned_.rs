@@ -2,7 +2,6 @@
     alloc::{Layout, LayoutError},
     borrow::{Borrow, BorrowMut},
     cmp,
-    convert::Infallible,
     fmt,
     marker::{PhantomPinned, Unsize},
     mem::{self, Alignment, ManuallyDrop, MaybeUninit},
@@ -466,6 +465,16 @@ where
     }
 }
 
+impl<T, A> fmt::Display for Owned<T, A>
+where
+    T: ?Sized + fmt::Display,
+    A: TrMalloc + Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
 impl<T, A> TrBoxed for Owned<T, A>
 where
     T: ?Sized,
@@ -476,7 +485,7 @@ where
 
     #[inline(always)]
     fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Malloc> {
-        Result::<&A, Infallible>::Ok(self.malloc())
+        Result::<&A, !>::Ok(self.malloc())
     }
 }
 

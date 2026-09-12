@@ -591,6 +591,16 @@ where
     }
 }
 
+impl<T, A> fmt::Display for Shared<T, A>
+where
+    T: ?Sized + fmt::Display,
+    A: TrMalloc + Clone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
 impl<T, A> TrBoxed for Shared<T, A>
 where
     T: ?Sized,

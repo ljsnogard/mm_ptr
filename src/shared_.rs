@@ -1,5 +1,5 @@
 ﻿use core::{
-    alloc::{Layout, LayoutError},
+    alloc::{AllocatorClone, AllocError, Layout, LayoutError},
     borrow::Borrow,
     cmp,
     convert::Infallible,
@@ -13,10 +13,7 @@
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use abs_mm::{
-    mem_alloc::{AllocError, TrMalloc},
-    res_man::{TrBoxed, TrStrongShared, TrWeakShared},
-};
+use abs_mm::res_man::{TrBoxed, TrStrongShared, TrWeakShared};
 use atomex::{AtomexPtr, AtomicCount, CmpxchResult, TrAtomicFlags};
 
 use crate::{
@@ -43,12 +40,12 @@ use crate::{
 pub struct Shared<T, A>(NonNull<SharedInner<T, A>>)
 where
     T: ?Sized,
-    A: TrMalloc + Clone;
+    A: AllocatorClone;
 
 impl<T, A> Shared<T, A>
 where
     T: Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     #[inline]
     pub fn new(data: T, alloc: A) -> Self {
@@ -177,7 +174,7 @@ where
 impl<T, A> Shared<[T], A>
 where
     T: Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pub fn new_slice<F>(len: usize, emplace_each: F, alloc: A) -> Self
     where
@@ -215,8 +212,7 @@ where
             ptr::slice_from_raw_parts_mut(p, len) as *mut SharedInner<[T], A>
         };
         let value_layout = match Layout::array::<T>(len) {
-            Result::Err(layout_err) =>
-                return Result::Err(AllocError::LayoutErr(layout_err)),
+            Result::Err(_) => return Result::Err(AllocError),
             Result::Ok(layout) => layout,
         };
         let p = unsafe {
@@ -228,7 +224,7 @@ where
 
 impl<T, A> Shared<[MaybeUninit<T>], A>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pub fn new_uninit_slice(len: usize, alloc: A) -> Self {
         Self::try_new_uninit_slice(len, alloc)
@@ -268,7 +264,7 @@ where
 impl<T, A> Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     /// Allocates an `SharedInner<T, A>` with sufficient space for
     /// a possibly-unsized inner value where the value has the layout provided,
@@ -282,9 +278,9 @@ where
         mem_to_inner: impl FnOnce(*mut u8) -> *mut SharedInner<T, A>,
     ) -> Result<*mut SharedInner<T, A>, AllocError> {
         let layout = inner_layout_for_value_layout(&alloc, value_layout)
-            .map_err(AllocError::LayoutErr)?;
+            .map_err(|_| AllocError)?;
         let Result::Ok(ptr) = alloc.allocate(layout) else {
-            return Result::Err(AllocError::Unknown);
+            return Result::Err(AllocError);
         };
         let inner = unsafe {
             Self::initialize_inner(ptr, layout, mem_to_inner, alloc)
@@ -315,7 +311,7 @@ fn inner_layout_for_value_layout<A>(
     layout: Layout,
 ) -> Result<Layout, LayoutError>
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     // Calculate layout using the given value layout.
     // Previously, layout was calculated on the expression
@@ -328,7 +324,7 @@ where
 impl<'a, T, A> Shared<T, A>
 where
     T: ?Sized,
-    A: 'a + TrMalloc + Clone,
+    A: 'a + AllocatorClone,
 {
     /// Try to leak resource without deallocating the memory.
     ///
@@ -411,7 +407,7 @@ where
 impl<T, A> Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     /// Allocate a header for weak pointers if it is not allocated, and then
     /// create a `Weak<T, A>` associated with the header.
@@ -486,7 +482,7 @@ where
 impl<T, A> Drop for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         let shared_inner = unsafe { self.0.as_mut() };
@@ -509,7 +505,7 @@ where
 impl<T, A> Clone for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn clone(&self) -> Self {
         Shared::from_shared_inner_(self.shared_inner_())
@@ -520,13 +516,13 @@ impl<T, U, A> CoerceUnsized<Shared<U, A>> for Shared<T, A>
 where
     T: ?Sized + Unsize<U>,
     U: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {}
 
 impl<T, A> Deref for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     type Target = T;
 
@@ -538,7 +534,7 @@ where
 impl<T, A> Borrow<T> for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn borrow(&self) -> &T {
         self.deref()
@@ -548,7 +544,7 @@ where
 impl<T, A> PartialEq for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn eq(&self, other: &Self) -> bool {
         ptr::eq(
@@ -561,13 +557,13 @@ where
 impl<T, A> Eq for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {}
 
 impl<T, A> PartialEq<Weak<T, A>> for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn eq(&self, other: &Weak<T, A>) -> bool {
         let Option::Some(w) = other.opt_weak_inner_() else {
@@ -584,7 +580,7 @@ where
 impl<T, A> fmt::Pointer for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_ptr().fmt(f)
@@ -594,7 +590,7 @@ where
 impl<T, A> fmt::Display for Shared<T, A>
 where
     T: ?Sized + fmt::Display,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(f)
@@ -604,13 +600,13 @@ where
 impl<T, A> TrBoxed for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
-    type Malloc = A;
+    type Alloc = A;
     type Item = T;
 
     #[inline(always)]
-    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Malloc> {
+    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Alloc> {
         Result::<&A, Infallible>::Ok(self.malloc())
     }
 }
@@ -618,7 +614,7 @@ where
 impl<T, A> TrStrongShared for Shared<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     type Downgraded = self::Weak<T, A>;
 
@@ -641,13 +637,13 @@ where
 unsafe impl<T, A> Send for Shared<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {}
 
 unsafe impl<T, A> Sync for Shared<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {}
 
 /// The weak pointer of Shared<T, A>. This is a different implementation from
@@ -658,7 +654,7 @@ where
 pub struct Weak<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     inner_: Option<NonNull<WeakInner<T, A>>>,
 }
@@ -695,7 +691,7 @@ impl error::Error for WeakUpgradeError
 impl<T, A> Weak<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pub const fn new() -> Self {
         Weak { inner_: Option::None }
@@ -782,7 +778,7 @@ where
 impl<T, A> Drop for Weak<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         let Option::Some(mut p_inner) = self.inner_ else {
@@ -819,7 +815,7 @@ where
 impl<T, A> Clone for Weak<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn clone(&self) -> Self {
         if let Option::Some(weak_inner) = self.opt_weak_inner_() {
@@ -833,7 +829,7 @@ where
 impl<T, A> TrWeakShared for Weak<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     type Item = T;
     type Upgraded = self::Shared<T, A>;
@@ -857,14 +853,14 @@ where
 impl<T, A> Default for Weak<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: ?Sized, A: TrMalloc + Clone> cmp::PartialEq for Weak<T, A> {
+impl<T: ?Sized, A: AllocatorClone> cmp::PartialEq for Weak<T, A> {
     fn eq(&self, other: &Self) -> bool {
         match (self.inner_, other.inner_) {
             (Option::Some(this), Option::Some(that))
@@ -875,16 +871,16 @@ impl<T: ?Sized, A: TrMalloc + Clone> cmp::PartialEq for Weak<T, A> {
     }
 }
 
-impl<T: ?Sized, A: TrMalloc + Clone> cmp::Eq for Weak<T, A> {}
+impl<T: ?Sized, A: AllocatorClone> cmp::Eq for Weak<T, A> {}
 
-impl<T: ?Sized, A: TrMalloc + Clone> cmp::PartialEq<Shared<T, A>> for Weak<T, A> {
+impl<T: ?Sized, A: AllocatorClone> cmp::PartialEq<Shared<T, A>> for Weak<T, A> {
     #[inline]
     fn eq(&self, other: &Shared<T, A>) -> bool {
         <Shared<T, A> as PartialEq<Weak<T, A>>>::eq(other, self)
     }
 }
 
-impl<T: ?Sized, A: TrMalloc + Clone> fmt::Pointer for Weak<T, A> {
+impl<T: ?Sized, A: AllocatorClone> fmt::Pointer for Weak<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Option::Some(p) = self.inner_ else {
             return ptr::null::<WeakInner<T, A>>().fmt(f);
@@ -896,22 +892,25 @@ impl<T: ?Sized, A: TrMalloc + Clone> fmt::Pointer for Weak<T, A> {
 unsafe impl<T, A> Send for Weak<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {}
 
 unsafe impl<T, A> Sync for Weak<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {}
 
-pub trait XtMallocShared: TrMalloc + Clone {
+pub trait XtMallocShared
+where
+    Self: AllocatorClone,
+{
     fn shared<T>(&self, t: T) -> Shared<T, Self>;
 }
 
 impl<A> XtMallocShared for A
 where
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn shared<T>(&self, t: T) -> Shared<T, Self> {
         Shared::<T, A>::new(t, self.clone())
@@ -922,7 +921,7 @@ where
 struct SharedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     _pin_: PhantomPinned,
     alloc_: A,
@@ -934,7 +933,7 @@ where
 impl<T, A> SharedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     #[allow(clippy::mut_from_ref)]
     fn refc_(&self) -> AtomicCount<usize, &mut AtomicUsize> {
@@ -1026,8 +1025,7 @@ where
             may_drop(self.data_ptr());
 
             let ptr = unsafe { NonNull::new_unchecked(this) };
-            let res = unsafe { alloc.deallocate(ptr, layout)};
-            assert!(res.is_ok());
+            unsafe { alloc.deallocate(ptr, layout) };
 
             if let Option::Some(guard) = opt_guard {
                 guard.reset_back_track();
@@ -1079,7 +1077,7 @@ enum ReleaseFailure {
 struct BackTrackSharedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pointer_: AtomexPtr<A>,
     _mark_t_: PhantomData<SharedInner<T, A>>,
@@ -1088,7 +1086,7 @@ where
 impl<T, A> BackTrackSharedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pub const fn new(p: &SharedInner<T, A>) -> Self {
         let pointer = AtomicPtr::new(&p.alloc_ as *const A as *mut A);
@@ -1198,7 +1196,7 @@ where
 struct BackTrackGuard<'a, T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     back_track_: &'a BackTrackSharedInner<T, A>,
     shared_inner_: Option<NonNull<SharedInner<T, A>>>,
@@ -1207,7 +1205,7 @@ where
 impl<'a, T, A> BackTrackGuard<'a, T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pub const fn new(
         back_track: &'a BackTrackSharedInner<T, A>,
@@ -1238,7 +1236,7 @@ where
 impl<'a, T, A> Drop for BackTrackGuard<'a, T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         let map_non_null = |p: NonNull<SharedInner<T, A>>| {
@@ -1265,7 +1263,7 @@ where
 struct WeakInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     _pinned_: PhantomPinned,
 
@@ -1280,7 +1278,7 @@ where
 impl<T, A> WeakInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: AllocatorClone,
 {
     pub const fn new(shared_inner: &SharedInner<T, A>) -> Self {
         let p = shared_inner as *const _ as *mut SharedInner<T, A>;
@@ -1326,9 +1324,12 @@ mod tests_ {
     extern crate alloc;
 
     use alloc::{sync::Arc, vec::Vec};
-    use core::ops::Deref;
+    use core::{
+        alloc::Allocator,
+        ops::Deref,
+    };
 
-    use abs_mm::mem_alloc::{AllocError, CoreAlloc, DeallocError, TrMalloc};
+    use abs_mm::CoreAlloc;
 
     use super::{Shared, XtMallocShared};
 
@@ -1358,7 +1359,7 @@ mod tests_ {
 
     #[test]
     fn coercion_should_work() {
-        let p: Shared<dyn TrMalloc<AllocErr = AllocError, DeallocErr = DeallocError>, CoreAlloc> =
+        let p: Shared<dyn Allocator, CoreAlloc> =
             Shared::new(CoreAlloc::new(), CoreAlloc::new());
         drop(p);
         let p: Shared<[usize], CoreAlloc> =

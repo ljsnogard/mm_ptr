@@ -1,5 +1,5 @@
 ﻿use core::{
-    alloc::{Layout, LayoutError},
+    alloc::{Allocator, AllocError, Layout, LayoutError},
     borrow::{Borrow, BorrowMut},
     cmp,
     fmt,
@@ -10,10 +10,7 @@
     ptr::{self, NonNull}
 };
 
-use abs_mm::{
-    mem_alloc::{AllocError, TrMalloc},
-    res_man::{TrBoxed, TrUnique},
-};
+use abs_mm::res_man::{TrBoxed, TrUnique};
 
 use crate::alloc_utils_::handle_alloc_error_;
 
@@ -23,12 +20,12 @@ use crate::alloc_utils_::handle_alloc_error_;
 pub struct Owned<T, A>(NonNull<OwnedInner<T, A>>)
 where
     T: ?Sized,
-    A: TrMalloc + Clone;
+    A: Allocator;
 
 impl<T, A> Owned<T, A>
 where
     T: Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     #[inline]
     pub fn new(data: T, alloc: A) -> Self {
@@ -114,7 +111,7 @@ where
 impl<T, A> Owned<[T], A>
 where
     T: Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     pub fn new_slice<F>(
         len: usize,
@@ -138,8 +135,7 @@ where
     {
         let array_layout = match Layout::array::<T>(len) {
             Result::Ok(x) => x,
-            Result::Err(layout_err) =>
-                return Result::Err(AllocError::LayoutErr(layout_err)),
+            Result::Err(_) => return Result::Err(AllocError),
         };
         unsafe {
             let mut a = Self::try_allocate_for_inner_with_slice(alloc, len, array_layout)?;
@@ -172,7 +168,7 @@ where
 impl<T, A> Owned<[MaybeUninit<T>], A>
 where
     T: Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     pub fn new_uninit_slice(len: usize, alloc: A) -> Self {
         Self::try_new_uninit_slice(len, alloc)
@@ -209,7 +205,7 @@ where
 impl<'a, T, A> Owned<T, A>
 where
     T: ?Sized,
-    A: 'a + TrMalloc + Clone,
+    A: 'a + Allocator,
 {
     pub fn leak(owned: Owned<T, A>) -> &'a mut T {
         let inner = unsafe { owned.0.as_ref() };
@@ -221,7 +217,7 @@ where
 impl<T, A> Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     /// Constructs an `Owned<T, A>` from a raw resource.
     ///
@@ -240,7 +236,7 @@ where
     /// # Examples
     ///
     /// ```
-    /// use abs_mm::mem_alloc::CoreAlloc;
+    /// use abs_mm::CoreAlloc;
     /// use mm_ptr::{Owned, XtMallocOwned};
     ///
     /// let x = CoreAlloc::default().owned("hello".to_owned());
@@ -319,12 +315,12 @@ unsafe fn try_allocate_for_layout<T, A>(
 ) -> Result<*mut OwnedInner<T, A>, AllocError>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     let layout = inner_layout_for_value_layout(&alloc, value_layout)
-        .map_err(AllocError::LayoutErr)?;
+        .map_err(|_| AllocError)?;
     let Result::Ok(ptr) = alloc.allocate(layout) else {
-        return Result::Err(AllocError::Unknown)
+        return Result::Err(AllocError)
     };
     let inner = unsafe {
         self::initialize_inner(ptr, layout, mem_to_inner, alloc)
@@ -340,7 +336,7 @@ unsafe fn initialize_inner<T, A>(
 ) -> *mut OwnedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     let inner = mem_to_inner(ptr.as_non_null_ptr().as_ptr());
     debug_assert_eq!(unsafe { Layout::for_value_raw(inner) }, layout);
@@ -355,7 +351,7 @@ unsafe fn from_owned_inner_<T, A>(
 ) -> Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     Owned(NonNull::new(inner).expect("ptr cannot be null"))
 }
@@ -366,7 +362,7 @@ fn inner_layout_for_value_layout<A>(
     layout: Layout,
 ) -> Result<Layout, LayoutError>
 where
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     // Calculate layout using the given value layout.
     // Previously, layout was calculated on the expression
@@ -379,7 +375,7 @@ where
 impl<T, A> Drop for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn drop(&mut self) {
         let inner = unsafe { self.0.as_mut() };
@@ -393,13 +389,13 @@ impl<T, U, A> CoerceUnsized<Owned<U, A>> for Owned<T, A>
 where
     T: ?Sized + Unsize<U>,
     U: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {}
 
 impl<T, A> Deref for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     type Target = T;
 
@@ -411,7 +407,7 @@ where
 impl<T, A> DerefMut for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.0.as_mut().data_ptr().as_mut() }
@@ -421,7 +417,7 @@ where
 impl<T, A> Borrow<T> for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn borrow(&self) -> &T {
         self.deref()
@@ -431,7 +427,7 @@ where
 impl<T, A> BorrowMut<T> for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn borrow_mut(&mut self) -> &mut T {
         self.deref_mut()
@@ -441,7 +437,7 @@ where
 impl<T, A> cmp::PartialEq for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn eq(&self, other: &Self) -> bool {
         ptr::eq(self.0.as_ptr(), other.0.as_ptr())
@@ -451,13 +447,13 @@ where
 impl<T, A> cmp::Eq for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {}
 
 impl<T, A> fmt::Pointer for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ptr = self.as_ptr();
@@ -468,7 +464,7 @@ where
 impl<T, A> fmt::Display for Owned<T, A>
 where
     T: ?Sized + fmt::Display,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(f)
@@ -478,13 +474,13 @@ where
 impl<T, A> TrBoxed for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
-    type Malloc = A;
+    type Alloc = A;
     type Item = T;
 
     #[inline(always)]
-    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Malloc> {
+    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Alloc> {
         Result::<&A, !>::Ok(self.malloc())
     }
 }
@@ -492,37 +488,34 @@ where
 impl<T, A> TrUnique for Owned<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {}
 
 unsafe impl<T, A> Send for Owned<T, A>
 where
     T: ?Sized + Send,
-    A: TrMalloc + Clone + Send,
+    A: Allocator + Send,
 {}
 
 unsafe impl<T, A> Sync for Owned<T, A>
 where
     T: ?Sized + Sync,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {}
 
 pub trait XtMallocOwned
 where
-    Self: TrMalloc + Clone,
+    Self: Sized + Allocator,
 {
-    fn owned<T>(&self, t: T) -> Owned<T, Self>;
+    fn owned<T>(self, t: T) -> Owned<T, Self>;
 }
 
 impl<A> XtMallocOwned for A
 where
-    A: TrMalloc + Clone,
+    A: Sized + Allocator,
 {
-    fn owned<T>(
-        &self,
-        t: T,
-    ) -> Owned<T, Self> {
-        Owned::<T, A>::new(t, self.clone())
+    fn owned<T>(self, t: T) -> Owned<T, Self> {
+        Owned::<T, A>::new(t, self)
     }
 }
 
@@ -531,7 +524,7 @@ where
 struct OwnedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     _pin_: PhantomPinned,
     alloc_: A,
@@ -541,7 +534,7 @@ where
 impl<T, A> OwnedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     pub const fn allocator(&self) -> &A {
         &self.alloc_
@@ -557,19 +550,18 @@ where
 impl<T, A> OwnedInner<T, A>
 where
     T: ?Sized,
-    A: TrMalloc + Clone,
+    A: Allocator,
 {
     pub fn release(
         &mut self,
         may_drop: impl FnOnce(NonNull<T>),
     ) {
         let ptr = unsafe { NonNull::new_unchecked(self as *mut _ as *mut u8) };
-        let alloc = self.allocator().clone();
+        let alloc = self.allocator();
         unsafe {
             let layout = Layout::for_value(self);
             may_drop(self.data_ptr());
-            let res = alloc.deallocate(ptr, layout);
-            assert!(res.is_ok());
+            alloc.deallocate(ptr, layout);
         }
     }
 }
@@ -577,17 +569,18 @@ where
 #[cfg(test)]
 mod tests_ {
     use std::{
+        alloc::Allocator,
         ops::Deref,
         sync::{Arc, Weak},
         vec::Vec,
     };
-    use abs_mm::mem_alloc::{CoreAlloc, AllocError, DeallocError, TrMalloc};
+    use abs_mm::CoreAlloc;
 
     use super::{Owned, XtMallocOwned};
 
     #[test]
     fn coercion_should_work() {
-        let p: Owned<dyn TrMalloc<AllocErr = AllocError, DeallocErr = DeallocError>, CoreAlloc> =
+        let p: Owned<dyn Allocator, CoreAlloc> =
             Owned::new(CoreAlloc::new(), CoreAlloc::new());
         drop(p);
         let p: Owned<[usize], CoreAlloc> =

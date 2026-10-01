@@ -24,7 +24,7 @@ use crate::{
 /// A atomic-reference-counted smart pointer for sharing the ownership of
 /// resource in a multi-threaded environment.
 ///
-/// This is not a drop-in replacement for `Arc<T>``. `Shared<T, A>` explicitly
+/// This is not a drop-in replacement for `Arc<T>`. `Shared<T, A>` explicitly
 /// separate the strong control block and the weak ones. So that when `T` drops,
 /// its memory is earlier reclaimed than the case in `Arc<T>`.
 ///
@@ -36,7 +36,6 @@ use crate::{
 /// | Allocation lifetime | independent     | tied to weak    |
 /// | Observation         | weak-side       | strong-side     |
 /// | Upgrade guarantee   | best-effort     | linearizable    |
-#[derive(Debug)]
 pub struct Shared<T, A>(NonNull<SharedInner<T, A>>)
 where
     T: ?Sized,
@@ -226,11 +225,57 @@ impl<T, A> Shared<[MaybeUninit<T>], A>
 where
     A: AllocatorClone,
 {
+    /// 构造一个长度为 `len` 的未初始化切片指针，元素类型为 `MaybeUninit<T>`。
+    ///
+    /// 对外形状对齐 `Arc::<[T]>::new_uninit_slice`：返回的指针拥有 `len` 个
+    /// 未初始化的槽位，调用方必须逐个写入后才能把内容当作 `[T]` 使用。
+    /// 注意 `Shared<T, A>` 只实现 `Deref` 而不实现 `DerefMut`，因此无法就地
+    /// 写入槽位：需要写入时应改用带 emplace 闭包的
+    /// [`new_slice`](Shared::new_slice)，或先用 [`try_leak`](Shared::try_leak)
+    /// 取回可变引用。
+    ///
+    /// # Panics
+    ///
+    /// 当 `len` 个 `MaybeUninit<T>` 的布局计算溢出，或分配器无法满足该布局时，
+    /// 经 `handle_alloc_error_` panic。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use abs_mm::CoreAlloc;
+    /// use core::mem::MaybeUninit;
+    /// use mm_ptr::Shared;
+    ///
+    /// let x: Shared<[MaybeUninit<u32>], CoreAlloc> =
+    ///     Shared::new_uninit_slice(3, CoreAlloc::default());
+    /// assert_eq!(x.len(), 3);
+    /// ```
     pub fn new_uninit_slice(len: usize, alloc: A) -> Self {
         Self::try_new_uninit_slice(len, alloc)
             .unwrap_or_else(|e| handle_alloc_error_::<[MaybeUninit<T>]>(e))
     }
 
+    /// [`new_uninit_slice`](Self::new_uninit_slice) 的可失败版本。
+    ///
+    /// 对外形状对齐 `Arc::<[T]>::try_new_uninit_slice`：失败时返回
+    /// `Err(AllocError)` 而不是 panic。
+    ///
+    /// # Errors
+    ///
+    /// 当 `len` 个 `MaybeUninit<T>` 的布局计算溢出（即 `Layout::array` 失败），
+    /// 或分配器无法满足该布局时，返回 `Err(AllocError)`。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use abs_mm::CoreAlloc;
+    /// use core::mem::MaybeUninit;
+    /// use mm_ptr::Shared;
+    ///
+    /// let x: Shared<[MaybeUninit<u32>], CoreAlloc> =
+    ///     Shared::try_new_uninit_slice(3, CoreAlloc::default()).unwrap();
+    /// assert_eq!(x.len(), 3);
+    /// ```
     pub fn try_new_uninit_slice(
         len: usize,
         alloc: A,
@@ -242,11 +287,56 @@ where
         }
     }
 
+    /// 构造一个长度为 `len` 的已零初始化切片指针，元素类型为 `MaybeUninit<T>`。
+    ///
+    /// 对外形状对齐 `Arc::<[T]>::new_zeroed_slice`：返回的指针拥有 `len` 个
+    /// 全零字节的槽位；由于元素类型是 `MaybeUninit<T>`，不要求 `T` 具备任何
+    /// “可零初始化”约束，某个零值对 `T` 是否合法仍由调用方判定。
+    ///
+    /// # Panics
+    ///
+    /// 当 `len` 个 `MaybeUninit<T>` 的布局计算溢出，或分配器无法满足该布局时，
+    /// 经 `handle_alloc_error_` panic。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use abs_mm::CoreAlloc;
+    /// use core::mem::MaybeUninit;
+    /// use mm_ptr::Shared;
+    ///
+    /// let x: Shared<[MaybeUninit<u32>], CoreAlloc> =
+    ///     Shared::new_zeroed_slice(3, CoreAlloc::default());
+    /// let read: Vec<u32> = x.iter().map(|m| unsafe { *m.assume_init_ref() }).collect();
+    /// assert_eq!(read, [0, 0, 0]);
+    /// ```
     pub fn new_zeroed_slice(len: usize, alloc: A) -> Self {
         Self::try_new_zeroed_slice(len, alloc)
             .unwrap_or_else(|e| handle_alloc_error_::<[MaybeUninit<T>]>(e))
     }
 
+    /// [`new_zeroed_slice`](Self::new_zeroed_slice) 的可失败版本。
+    ///
+    /// 对外形状对齐 `Arc::<[T]>::try_new_zeroed_slice`：失败时返回
+    /// `Err(AllocError)` 而不是 panic。
+    ///
+    /// # Errors
+    ///
+    /// 当 `len` 个 `MaybeUninit<T>` 的布局计算溢出（即 `Layout::array` 失败），
+    /// 或分配器无法满足该布局时，返回 `Err(AllocError)`。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use abs_mm::CoreAlloc;
+    /// use core::mem::MaybeUninit;
+    /// use mm_ptr::Shared;
+    ///
+    /// let x: Shared<[MaybeUninit<u32>], CoreAlloc> =
+    ///     Shared::try_new_zeroed_slice(3, CoreAlloc::default()).unwrap();
+    /// let read: Vec<u32> = x.iter().map(|m| unsafe { *m.assume_init_ref() }).collect();
+    /// assert_eq!(read, [0, 0, 0]);
+    /// ```
     pub fn try_new_zeroed_slice(
         len: usize,
         alloc: A,
@@ -587,6 +677,33 @@ where
     }
 }
 
+/// 为 `Shared<T, A>` 提供不依赖类型参数的调试输出。
+///
+/// 该实现不要求 `T: Debug`，也不要求 `A: Debug`，任何 `Shared<T, A>` 自身
+/// 都无条件地实现 `fmt::Debug`；输出形式为元组结构体风格，字段是内部指针地址。
+///
+/// # Examples
+///
+/// ```
+/// use abs_mm::CoreAlloc;
+/// use mm_ptr::{Shared, XtMallocShared};
+///
+/// // 刻意没有实现 `Debug` 的类型。
+/// struct NotDebug;
+///
+/// let x: Shared<NotDebug, CoreAlloc> = CoreAlloc::default().shared(NotDebug);
+/// assert!(format!("{x:?}").starts_with("Shared(0x"));
+/// ```
+impl<T, A> fmt::Debug for Shared<T, A>
+where
+    T: ?Sized,
+    A: AllocatorClone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Shared").field(&self.0).finish()
+    }
+}
+
 impl<T, A> fmt::Display for Shared<T, A>
 where
     T: ?Sized + fmt::Display,
@@ -650,13 +767,43 @@ where
 /// `Arc<T>`'s weak. `Weak<T, A>` has its independent control block, so that the
 /// existence of weak pointers will not prevent reclaiming memory used by `T` in
 /// `Shared<T, A>`.
-#[derive(Debug)]
 pub struct Weak<T, A>
 where
     T: ?Sized,
     A: AllocatorClone,
 {
     inner_: Option<NonNull<WeakInner<T, A>>>,
+}
+
+/// 为 `Weak<T, A>` 提供不依赖类型参数的调试输出。
+///
+/// 该实现不要求 `T: Debug`，也不要求 `A: Debug`，任何 `Weak<T, A>` 自身
+/// 都无条件地实现 `fmt::Debug`；输出形式与派生实现一致，为结构体字段形式
+/// `Weak { inner_: ... }`。
+///
+/// # Examples
+///
+/// ```
+/// use abs_mm::CoreAlloc;
+/// use mm_ptr::{Shared, XtMallocShared};
+///
+/// // 刻意没有实现 `Debug` 的类型。
+/// struct NotDebug;
+///
+/// let shared: Shared<NotDebug, CoreAlloc> = CoreAlloc::default().shared(NotDebug);
+/// let weak = Shared::downgrade(&shared);
+/// assert!(format!("{weak:?}").starts_with("Weak { inner_: Some(0x"));
+/// ```
+impl<T, A> fmt::Debug for Weak<T, A>
+where
+    T: ?Sized,
+    A: AllocatorClone,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Weak")
+            .field("inner_", &self.inner_)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1325,13 +1472,66 @@ mod tests_ {
 
     use alloc::{sync::Arc, vec::Vec};
     use core::{
-        alloc::Allocator,
+        alloc::{Allocator, AllocatorClone},
         ops::Deref,
     };
 
     use abs_mm::CoreAlloc;
 
-    use super::{Shared, XtMallocShared};
+    use super::{Shared, Weak, XtMallocShared};
+
+    /// 用于验证 `Debug` 实现不依赖 `T: Debug` 的载荷类型，刻意不派生 `Debug`。
+    struct NotDebug;
+
+    /// 测试 `Shared<T, A>` 在载荷类型未实现 `Debug` 时依然实现 `fmt::Debug`。
+    /// - 手段：以刻意未实现 `Debug` 的 `NotDebug` 作为载荷、`CoreAlloc` 作为分配器，
+    ///   构造 `Shared<NotDebug, CoreAlloc>`，再用 `format!("{x:?}")` 格式化该指针；
+    ///   同时在测试体内定义一个只声明 `T: ?Sized`、`A: AllocatorClone` 的泛型函数，
+    ///   在其函数体中把 `Shared<T, A>` 交给仅接受 `Debug` 类型的断言函数。
+    /// - 判断：格式化结果以 `"Shared(0x"` 开头，说明输出内容是内部指针地址；
+    ///   泛型函数体在编译期仅依据已声明约束检查，能通过即证明 `fmt::Debug`
+    ///   实现未隐藏 `T: Debug` / `A: Debug` 约束，若将来被加上则此处编译失败。
+    #[test]
+    fn debug_should_work_without_t_debug_() {
+        fn assert_debug<T: ?Sized + core::fmt::Debug>() {}
+        fn assert_debug_bounds_are_unconditional<T: ?Sized, A: AllocatorClone>() {
+            assert_debug::<Shared<T, A>>();
+        }
+        assert_debug_bounds_are_unconditional::<NotDebug, CoreAlloc>();
+
+        let x: Shared<NotDebug, CoreAlloc> = CoreAlloc::new().shared(NotDebug);
+        let displayed = std::format!("{x:?}");
+        assert!(
+            displayed.starts_with("Shared(0x"),
+            "unexpected debug output: {displayed}",
+        );
+    }
+
+    /// 测试 `Weak<T, A>` 在载荷类型未实现 `Debug` 时依然实现 `fmt::Debug`。
+    /// - 手段：以刻意未实现 `Debug` 的 `NotDebug` 作为载荷、`CoreAlloc` 作为分配器，
+    ///   构造 `Shared<NotDebug, CoreAlloc>` 并降级得到 `Weak<NotDebug, CoreAlloc>`，
+    ///   再用 `format!("{w:?}")` 格式化该弱指针；同时在测试体内定义一个只声明
+    ///   `T: ?Sized`、`A: AllocatorClone` 的泛型函数，在其函数体中把 `Weak<T, A>`
+    ///   交给仅接受 `Debug` 类型的断言函数。
+    /// - 判断：格式化结果以 `"Weak { inner_: Some(0x"` 开头，即与派生实现输出一致；
+    ///   泛型函数体在编译期仅依据已声明约束检查，能通过即证明 `fmt::Debug`
+    ///   实现未隐藏 `T: Debug` / `A: Debug` 约束，若将来被加上则此处编译失败。
+    #[test]
+    fn debug_weak_should_work_without_t_debug_() {
+        fn assert_debug<T: ?Sized + core::fmt::Debug>() {}
+        fn assert_debug_bounds_are_unconditional<T: ?Sized, A: AllocatorClone>() {
+            assert_debug::<Weak<T, A>>();
+        }
+        assert_debug_bounds_are_unconditional::<NotDebug, CoreAlloc>();
+
+        let x: Shared<NotDebug, CoreAlloc> = CoreAlloc::new().shared(NotDebug);
+        let weak = Shared::downgrade(&x);
+        let displayed = std::format!("{weak:?}");
+        assert!(
+            displayed.starts_with("Weak { inner_: Some(0x"),
+            "unexpected debug output: {displayed}",
+        );
+    }
 
     #[test]
     fn smoke() {

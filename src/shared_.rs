@@ -751,16 +751,29 @@ where
     }
 }
 
+// SAFETY: `Shared<T, A>` 允许在多线程环境中共享，因此它与 `Arc<T, A>` 的约束
+// 必须一致。
+// - `T: Send + Sync`：`T` 的析构可能发生在任意线程（`Shared::drop` 最终会
+//   `drop_in_place` 载荷），故需要 `T: Send`；而 `Deref` 与 `Clone` 允许并发地
+//   由 `&Shared` 取得 `&T`，故需要 `T: Sync`。
+// - `A: Send`：`SharedInner<T, A>` 内嵌了一份 `A`，`Shared` 被移动到其他线程后
+//   会在那个线程调用 `A::deallocate`，`Shared::downgrade` 也会在那个线程
+//   `clone` 出 `A` 来分配 `WeakInner`，故需要 `A: Send`。
+// - `A: Sync`：`Shared::malloc` 会从 `&self` 交出 `&A`，而 `Shared` 可在多个线程
+//   上被同时 `clone`/`downgrade`，故需要 `A: Sync` 才能并发共享 `&A`。
 unsafe impl<T, A> Send for Shared<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {}
 
+// SAFETY: 与 `Send` 实现同理；`Sync` 意味着 `&Shared<T, A>` 本身可跨线程共享，
+// 于是 `&T` 与 `&A` 都可能被多个线程并发访问，同样要求 `T: Send + Sync` 与
+// `A: Send + Sync`。
 unsafe impl<T, A> Sync for Shared<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {}
 
 /// The weak pointer of Shared<T, A>. This is a different implementation from
@@ -1036,16 +1049,27 @@ impl<T: ?Sized, A: AllocatorClone> fmt::Pointer for Weak<T, A> {
     }
 }
 
+// SAFETY: `Weak<T, A>` 与 `Shared<T, A>` 一样允许在多线程环境中共享，其约束与
+// `Arc<T, A>::Weak` 一致。
+// - `T: Send + Sync`：升级/降级不访问 `T` 本身，但 `Weak` 可被跨线程持有，
+//   且它与 `Shared<T, A>` 相互转换，故沿用 `Shared<T, A>` 对 `T` 的要求。
+// - `A: Send`：`WeakInner` 由 `A` 分配，并在 `Weak` 的最后一次析构时经
+//   `WeakInner::release_weak_inner`（`Owned<WeakInner<T, A>, A>`）在该线程释放，
+//   `Weak::allocator` 也会交出内部的 `A`，故需要 `A: Send`。
+// - `A: Sync`：`Weak::allocator` 从 `&self` 交出 `&A`，`&Weak` 可跨线程共享，
+//   故需要 `A: Sync`。
 unsafe impl<T, A> Send for Weak<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {}
 
+// SAFETY: 与 `Send` 实现同理；`Sync` 意味着 `&Weak<T, A>` 可跨线程共享，
+// `&A` 可能被并发访问，故同样要求 `T: Send + Sync` 与 `A: Send + Sync`。
 unsafe impl<T, A> Sync for Weak<T, A>
 where
     T: ?Sized + Send + Sync,
-    A: AllocatorClone,
+    A: AllocatorClone + Send + Sync,
 {}
 
 pub trait XtMallocShared
@@ -1630,5 +1654,27 @@ mod tests_ {
         let upgrade_result = arc_weak.upgrade();
         assert!(upgrade_result.is_some());
         assert_eq!(upgrade_result.unwrap(), arc);
+    }
+
+    /// 测试 `Shared<T, A>` 与 `Weak<T, A>` 的 `Send`/`Sync` 约束形状与 `Arc<T, A>` 对齐。
+    /// - 手段：定义只声明 `T: ?Sized + Send + Sync`、`A: AllocatorClone + Send + Sync`
+    ///   的泛型函数，在其中把 `Shared<T, A>` 与 `Weak<T, A>` 交给只接受 `Send`
+    ///   或只接受 `Sync` 的断言函数；再以 `CoreAlloc` 实例化该泛型函数。
+    /// - 判断：该泛型函数体仅凭上述边界即可通过编译，说明这两个 impl 的约束不严于
+    ///   `Arc<T, A>` 的对应 impl（没有诸如 `A: 'static` 之类的额外要求）；若将来
+    ///   有人给 impl 添加超出此处的约束，本测试会编译失败。约束的下界（即
+    ///   `A: !Send` 或 `A: !Sync` 时不得实现 `Send`/`Sync`）无法用正向断言表达，
+    ///   由 impl 的 `where` 子句与 `// SAFETY:` 注释共同保证。
+    #[test]
+    fn send_sync_bounds_should_match_arc_() {
+        fn assert_send<T: ?Sized + Send>() {}
+        fn assert_sync<T: ?Sized + Sync>() {}
+        fn check<T: ?Sized + Send + Sync, A: AllocatorClone + Send + Sync>() {
+            assert_send::<Shared<T, A>>();
+            assert_sync::<Shared<T, A>>();
+            assert_send::<Weak<T, A>>();
+            assert_sync::<Weak<T, A>>();
+        }
+        check::<u8, CoreAlloc>();
     }
 }

@@ -611,16 +611,24 @@ where
     A: Allocator,
 {}
 
+// SAFETY: `Owned<T, A>` 拥有 `OwnedInner<T, A>`，其中同时内嵌了 `A` 与 `T`，
+// 因此与 `Box<T, A>`（其 `Send`/`Sync` 由字段自动推导）的约束一致：
+// - `Send` 要求 `T: Send`（`T` 会随指针跨线程析构）与 `A: Send`
+//   （`A` 会随指针跨线程使用，并在该线程执行 `deallocate`）；
+// - `Sync` 要求 `T: Sync` 与 `A: Sync`（`&Owned` 可跨线程共享，而 `Deref`
+//   与 `Owned::malloc` 分别由 `&Owned` 交出 `&T` 与 `&A`）。
 unsafe impl<T, A> Send for Owned<T, A>
 where
     T: ?Sized + Send,
     A: Allocator + Send,
 {}
 
+// SAFETY: 见上面的 `Send` 实现。`Box<T, A>` 的自动推导同时要求 `A: Sync`，
+// 这里必须显式写出，否则 `&Owned` 可以在多个线程上并发取得同一个 `&A`。
 unsafe impl<T, A> Sync for Owned<T, A>
 where
     T: ?Sized + Sync,
-    A: Allocator,
+    A: Allocator + Sync,
 {}
 
 pub trait XtMallocOwned
@@ -817,5 +825,25 @@ mod tests_ {
             .collect();
         drop(u_slice);
         assert!(w_slice.iter().all(|w| w.upgrade().is_none()));
+    }
+
+    /// 测试 `Owned<T, A>` 的 `Send`/`Sync` 约束形状与 `Box<T, A>` 对齐。
+    /// - 手段：定义只声明 `T: ?Sized + Send + Sync`、`A: Allocator + Send + Sync`
+    ///   的泛型函数，在其中把 `Owned<T, A>` 交给只接受 `Send` 或只接受 `Sync`
+    ///   的断言函数；再以 `CoreAlloc` 实例化该泛型函数。
+    /// - 判断：该泛型函数体仅凭上述边界即可通过编译，说明 `Owned` 的两个 impl 不严于
+    ///   `Box<T, A>` 的自动推导约束（`T: Send + A: Send` 与 `T: Sync + A: Sync`）；
+    ///   若将来有人添加额外约束，本测试会编译失败。约束的下界（即 `A: !Send`
+    ///   或 `A: !Sync` 时不得实现 `Send`/`Sync`）无法用正向断言表达，由 impl 的
+    ///   `where` 子句与 `// SAFETY:` 注释共同保证。
+    #[test]
+    fn send_sync_bounds_should_match_box_() {
+        fn assert_send<T: ?Sized + Send>() {}
+        fn assert_sync<T: ?Sized + Sync>() {}
+        fn check<T: ?Sized + Send + Sync, A: Allocator + Send + Sync>() {
+            assert_send::<Owned<T, A>>();
+            assert_sync::<Owned<T, A>>();
+        }
+        check::<u8, CoreAlloc>();
     }
 }

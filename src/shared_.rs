@@ -13,7 +13,7 @@
     sync::atomic::{AtomicPtr, AtomicUsize},
 };
 
-use abs_mm::res_man::{TrBoxed, TrStrongShared, TrWeakShared};
+use abs_mm::res_man::{TrAllocBy, TrBoxed, TrStrongShared, TrWeakShared};
 use atomex::{AtomexPtr, AtomicCount, CmpxchResult, TrAtomicFlags};
 
 use crate::{
@@ -711,6 +711,18 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(f)
+    }
+}
+
+impl<T, A> TrAllocBy for Shared<T, A>
+where
+    T: ?Sized,
+    A: AllocatorClone,
+{
+    type Alloc = A;
+
+    fn mem_alloc(&self) -> &Self::Alloc {
+        self.malloc()
     }
 }
 

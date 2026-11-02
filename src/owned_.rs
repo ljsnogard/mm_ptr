@@ -10,7 +10,7 @@
     ptr::{self, NonNull}
 };
 
-use abs_mm::res_man::{TrBoxed, TrUnique};
+use abs_mm::res_man::{TrAllocBy, TrBoxed, TrUnique};
 
 use crate::alloc_utils_::handle_alloc_error_;
 
@@ -588,6 +588,18 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.deref().fmt(f)
+    }
+}
+
+impl<T, A> TrAllocBy for Owned<T, A>
+where
+    T: ?Sized,
+    A: Allocator,
+{
+    type Alloc = A;
+
+    fn mem_alloc(&self) -> &Self::Alloc {
+        self.malloc()
     }
 }
 

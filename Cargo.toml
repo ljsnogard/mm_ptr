@@ -8,7 +8,7 @@ description = "Smart pointers implementing abs_mm"
 repository = "https://github.com/ljsnogard/mm_ptr"
 keywords = ["pointer", "alloc"]
 categories = ["no-std"]
-license = "MIT/Apache-2.0"
+license = "AGPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]

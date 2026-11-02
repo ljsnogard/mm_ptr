@@ -719,13 +719,7 @@ where
     T: ?Sized,
     A: AllocatorClone,
 {
-    type Alloc = A;
     type Item = T;
-
-    #[inline(always)]
-    fn try_get_mem_alloc(&self) -> impl Try<Output = &Self::Alloc> {
-        Result::<&A, Infallible>::Ok(self.malloc())
-    }
 }
 
 impl<T, A> TrStrongShared for Shared<T, A>

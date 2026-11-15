@@ -13,4 +13,6 @@ readme = "README.md"
 
 [dependencies]
 abs_mm = { git = "https://gitee.com/lino_snsalias/abs_mm.git", version = "0.3.0", branch = "dev/0.3.0" }
-atomex = { git = "https://gitee.com/lino_snsalias/atomex-rs.git", branch = "dev/0.1.2" }
+# atomex 与 atomic_sync 一样来自 abs_sync.rs 仓库（其 workspace 成员），
+# 避免同一 crate 在依赖树里出现两个不同 git 来源的副本。
+atomex = { git = "https://gitee.com/lino_snsalias/abs_sync.rs.git", version = "0.1.2" }
